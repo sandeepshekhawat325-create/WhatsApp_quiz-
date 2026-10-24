@@ -625,7 +625,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ==========================================
-# FLASK & WEBHOOK SETUP (Background Thread)
+# FLASK WEBHOOK SETUP (Background Thread)
 # ==========================================
 @app.route('/')
 def home():
@@ -655,7 +655,8 @@ def webhook():
 
 async def main_async():
     global application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).drop_pending_updates(True).build()
+    # Webhook mode setup (No polling/getUpdates used anywhere)
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
@@ -665,7 +666,7 @@ async def main_async():
     
     await application.initialize()
     
-    # Force delete any previous webhooks and set fresh one
+    # Drop pending updates and safely set the webhook URL
     await application.bot.delete_webhook(drop_pending_updates=True)
     webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
     await application.bot.set_webhook(url=webhook_url)
@@ -689,9 +690,9 @@ if __name__ == '__main__':
         asyncio.set_event_loop(loop)
         loop.run_until_complete(main_async())
 
-    # Start bot in a background thread so Flask can take the main port
+    # Start bot in a background thread so Flask handles the main server port
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
 
-    # Run Flask on the port required by Render
+    # Run Flask to satisfy Render's port binding requirements
     app.run(host="0.0.0.0", port=PORT)
