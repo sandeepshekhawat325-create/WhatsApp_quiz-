@@ -1,416 +1,226 @@
 import os
-import re
-import json
+import io
 import time
-import pymupdf  # PDF read karne ke liye
-from docx import Document  # Word (.docx) read karne ke liye
-import feedparser  # YouTube RSS feed read karne ke liye
-import requests
-import threading
+import logging
+import urllib.parse
 from flask import Flask, request
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import fitz  # PyMuPDF
+import docx
 
-app = Flask(__name__)
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Environment Variables
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
-TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "@special_education_needs")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")  # e.g. @your_channel_username or -100xxx
 
-# Meta WhatsApp Cloud API Credentials for Personal Number
-WA_PHONE_NUMBER_ID = os.environ.get("WA_PHONE_NUMBER_ID", "1297728493425237")
-WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "EAAUv4VEpbrQBSZCKoSZC65TyT8dXcYOS5xSvklIWathdVYSPLzMM1q0ZBRIYqStNrnpOFAc23SCwhBV7AFbg2L9Vgp16E0KU3solaNhcZBNhXkEWb2NE9HZBSA9GTiQU8uaJ8fAqv7cdEEzS1Uy6yVBwBe4ffH620JjL955xrl036NSUKKHYIFiQnn0g2qQZDZD")
-# Yahan apna WhatsApp number dalein bina '+' ke, country code ke sath (jaise: 919828625119)
-WA_RECIPIENT_PHONE = os.environ.get("WA_RECIPIENT_PHONE", "919828625119")
+# Flask App for Webhook / Keep-alive
+app = Flask(__name__)
 
-YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "")
-
-QUEUE_FILE = "quiz_queue.json"
-STATE_FILE = "bot_state.json"
+# Global In-Memory Queue for Quizzes
+quiz_queue = []
+is_auto_posting = False
 
 @app.route('/')
 def home():
-    q_count = len(load_queue())
-    state = load_bot_state()
-    return f"Bot Mode: {state.get('mode', 'MANUAL')} | Interval: {state.get('interval', 10)}m | Queue: {q_count}"
+    return "Quiz Bot is running smoothly!"
 
-@app.route('/app-notification', methods=['POST'])
-def app_notification():
-    try:
-        data = request.json or request.form
-        notif_title = data.get("title", "App Notification")
-        notif_msg = data.get("message", "Nayi update aayi hai!")
-        
-        formatted_msg = (
-            f"🔔 *{notif_title}*\n\n"
-            f"{notif_msg}\n\n"
-            f"📘 *Special Education Notes | 9828625119*"
-        )
-        if WA_RECIPIENT_PHONE:
-            send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, formatted_msg)
-        send_tg_channel_msg(formatted_msg)
-        return {"status": "success", "message": "Notification sent!"}, 200
-    except Exception as e:
-        return {"status": "error", "error": str(e)}, 500
+def extract_text_from_pdf(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
 
-def load_queue():
-    if os.path.exists(QUEUE_FILE):
-        try:
-            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
-    return []
+def extract_text_from_docx(file_bytes):
+    doc = docx.Document(io.BytesIO(file_bytes))
+    text = "\n".join([p.text for p in doc.paragraphs])
+    return text
 
-def save_queue(data):
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def load_bot_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {"mode": "MANUAL", "interval": 10}
-    return {"mode": "MANUAL", "interval": 10}
-
-def save_bot_state(state_data):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state_data, f)
-
-def send_tg_msg_with_buttons(chat_id, text, keyboard=None):
-    if not BOT_TOKEN or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if keyboard:
-        payload["reply_markup"] = json.dumps(keyboard)
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print("Telegram Send Error:", e)
-
-def send_tg_msg(chat_id, text):
-    send_tg_msg_with_buttons(chat_id, text)
-
-def send_tg_channel_msg(text):
-    if BOT_TOKEN and TG_CHANNEL_ID:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={"chat_id": TG_CHANNEL_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-        res_json = resp.json()
-        if not res_json.get("ok"):
-            return res_json.get("description", "Unknown Error")
-        return None
-
-def get_correct_option_index(answer_str, options):
-    ans_clean = answer_str.strip().lower()
-    mapping = {'a': 0, 'b': 1, 'c': 2, 'd': 3, '1': 0, '2': 1, '3': 2, '4': 3}
-    if ans_clean in mapping:
-        idx = mapping[ans_clean]
-        if idx < len(options):
-            return idx
-    for i, opt in enumerate(options):
-        if ans_clean in opt.lower():
-            return i
-    return 0
-
-def send_tg_channel_quiz(quiz):
-    if BOT_TOKEN and TG_CHANNEL_ID:
-        correct_idx = get_correct_option_index(quiz["answer"], quiz["options"])
-        explanation_text = (
-            f"✅ Sahi Uttar: {quiz['answer']}\n"
-            f"💡 Solution: {quiz['explanation']}\n\n"
-            f"📘 Special Education Notes | 9828625119"
-        )
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
-        resp = requests.post(url, json={
-            "chat_id": TG_CHANNEL_ID,
-            "question": quiz["question"][:290],
-            "options": quiz["options"][:10],
-            "is_anonymous": True,
-            "type": "quiz",
-            "correct_option_id": correct_idx,
-            "explanation": explanation_text[:200],
-            "explanation_parse_mode": "Markdown"
-        }, timeout=10)
-        res_json = resp.json()
-        if not res_json.get("ok"):
-            print("TG Quiz Error:", res_json)
-            return res_json.get("description", "Unknown Error")
-        return None
-
-# Meta WhatsApp Cloud API Message to Phone Number
-def send_meta_whatsapp_msg(to_phone, text):
-    if WA_PHONE_NUMBER_ID and WA_API_TOKEN and to_phone:
-        url = f"https://graph.facebook.com/v18.0/{WA_PHONE_NUMBER_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WA_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to_phone,
-            "type": "text",
-            "text": {"body": text}
-        }
-        try:
-            requests.post(url, headers=headers, json=payload, timeout=15)
-        except Exception as e:
-            print("Meta WA Error:", e)
-
-def extract_text_from_docx(docx_path):
-    try:
-        doc = Document(docx_path)
-        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    except Exception as e:
-        print("DOCX Read Error:", e)
-        return ""
-
-def extract_text_from_pdf(pdf_path):
-    try:
-        doc = pymupdf.open(pdf_path)
-        return "".join([page.get_text("text") + "\n" for page in doc])
-    except Exception as e:
-        print("PDF Read Error:", e)
-        return ""
-
-def extract_mcqs_from_text(full_text):
-    blocks = re.split(r'\n(?=Question:|\bQ\.?\s*\d+|\b\d+[\.\)]|प्रश्न\s*\d+)', full_text)
-    extracted = []
+def parse_mcqs_from_text(text):
+    """
+    Simple parser expecting structured text format:
+    Q: Question text?
+    A) Option 1
+    B) Option 2
+    C) Option 3
+    D) Option 4
+    Ans: A
+    """
+    questions = []
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
     
-    for block in blocks:
-        lines = [line.strip() for line in block.strip().split('\n') if line.strip()]
-        if len(lines) < 3:
-            continue
-            
-        question_lines = []
-        options = []
-        answer = "a"
-        explanation = "Special Education Notes | 9828625119"
-        
-        mode = "q"
-        for line in lines:
-            if re.match(r'^[\(\[]?[A-Da-d1-4][\)\]\.]\s+', line) and len(options) < 4:
-                mode = "opt"
-                clean_opt = re.sub(r'^[\(\[]?[A-Da-d1-4][\)\]\.]\s*', '', line).strip()
-                options.append(clean_opt[:100])
-            elif re.match(r'^(?:Ans|Answer|उत्तर|सही उत्तर)\s*[:\-]', line, re.I):
-                mode = "ans"
-                answer = re.sub(r'^(?:Ans|Answer|उत्तर|सही उत्तर)\s*[:\-]\s*', '', line, flags=re.I).strip()
-            elif re.match(r'^(?:Exp|Explanation|Solution|व्याख्या|हल|Positive Marks)\s*[:\-]', line, re.I):
-                mode = "exp"
-                explanation = re.sub(r'^(?:Exp|Explanation|Solution|व्याख्या|हल|Positive Marks)\s*[:\-]\s*', '', line, flags=re.I).strip()
-            else:
-                if mode == "q":
-                    question_lines.append(line)
-                elif mode == "exp":
-                    explanation += " " + line
-                    
-        if question_lines and len(options) == 4:
-            q_text = " ".join(question_lines)
-            q_text = re.sub(r'^(?:Question:|\bQ\.?\s*\d+|\b\d+[\.\)]|प्रश्न\s*\d+)\s*', '', q_text, flags=re.I).strip()
-            extracted.append({
-                "question": q_text[:250],
-                "options": options,
-                "answer": answer,
-                "explanation": explanation
-            })
-    return extracted
+    current_q = None
+    options = []
+    correct_idx = 0
 
-def post_one_quiz():
-    queue = load_queue()
-    if not queue:
+    for line in lines:
+        if line.lower().startswith(("q:", "q.", "question")):
+            if current_q and len(options) >= 2:
+                questions.append({
+                    "question": current_q,
+                    "options": options[:4],
+                    "correct_option_id": correct_idx
+                })
+            current_q = line.split(":", 1)[-1].strip() if ":" in line else line
+            options = []
+            correct_idx = 0
+        elif line.lower().startswith(("a)", "b)", "c)", "d)", "a.", "b.", "c.", "d.")):
+            options.append(line[2:].strip())
+        elif line.lower().startswith(("ans:", "answer:", "ans-")):
+            ans_str = line.split(":", 1)[-1].strip().upper()
+            if "A" in ans_str: correct_idx = 0
+            elif "B" in ans_str: correct_idx = 1
+            elif "C" in ans_str: correct_idx = 2
+            elif "D" in ans_str: correct_idx = 3
+
+    if current_q and len(options) >= 2:
+        questions.append({
+            "question": current_q,
+            "options": options[:4],
+            "correct_option_id": correct_idx
+        })
+
+    return questions
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to MCQ Quiz Automation Bot!\n\n"
+        "📁 Simply send me a PDF or DOCX file containing MCQs.\n"
+        "I will parse them into quizzes and allow you to auto-post to your Telegram Channel with a direct 📲 *Share to WhatsApp* button!"
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_queue
+    document = update.message.document
+    file_name = document.file_name.lower()
+    
+    bot_file = await document.get_file()
+    file_bytes = await bot_file.download_as_bytearray()
+    
+    await update.message.reply_text("⏳ Processing document and extracting MCQs...")
+    
+    extracted_text = ""
+    if file_name.endswith('.pdf'):
+        extracted_text = extract_text_from_pdf(file_bytes)
+    elif file_name.endswith(('.docx', '.doc')):
+        extracted_text = extract_text_from_docx(file_bytes)
+    else:
+        await update.message.reply_text("❌ Unsupported file format. Please send PDF or DOCX.")
+        return
+
+    parsed_quizzes = parse_mcqs_from_text(extracted_text)
+    
+    if not parsed_quizzes:
+        await update.message.reply_text("⚠️ No valid MCQs found in the document. Please check the format.")
+        return
+
+    quiz_queue.extend(parsed_quizzes)
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 Post 1 Next Poll Now", callback_data="post_one")],
+        [InlineKeyboardButton("▶️ Start Auto Posting", callback_data="start_auto")],
+        [InlineKeyboardButton("⏸ Stop Auto Posting", callback_data="stop_auto")],
+        [InlineKeyboardButton("📊 View Queue Status", callback_data="status")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"✅ Successfully extracted {len(parsed_quizzes)} MCQs!\n"
+        f"📋 Total Queue Size: {len(quiz_queue)}\n\n"
+        f"Choose an option below:",
+        reply_markup=reply_markup
+    )
+
+async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE):
+    global quiz_queue
+    if not quiz_queue:
+        logger.info("Quiz queue is empty.")
         return False
-    
-    quiz = queue.pop(0)
-    save_queue(queue)
-    
-    # 1. Telegram Channel Quiz
-    if BOT_TOKEN and TG_CHANNEL_ID:
-        send_tg_channel_quiz(quiz)
 
-    # 2. WhatsApp Personal Number Message
-    if WA_RECIPIENT_PHONE:
-        wa_text = (
-            f"❓ *{quiz['question']}*\n\n"
-            f"a) {quiz['options'][0]}\n"
-            f"b) {quiz['options'][1]}\n"
-            f"c) {quiz['options'][2]}\n"
-            f"d) {quiz['options'][3]}\n\n"
-            f"✅ *Answer:* {quiz['answer']}\n"
-            f"💡 *Solution:* {quiz['explanation']}\n\n"
-            f"📘 *Special Education Notes | 9828625119*"
-        )
-        send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, wa_text)
-        
-    return True
+    item = quiz_queue.pop(0)
+    q_text = item["question"]
+    opts = item["options"]
+    correct = item["correct_option_id"]
 
-def auto_posting_thread():
-    while True:
+    # Format text for WhatsApp Share URL
+    wa_text = f"❓ *{q_text}*\n\n"
+    for idx, opt in enumerate(opts):
+        prefix = ["A", "B", "C", "D"][idx]
+        wa_text += f"{prefix}) {opt}\n"
+    
+    encoded_wa_text = urllib.parse.quote(wa_text)
+    whatsapp_share_url = f"https://api.whatsapp.com/send?text={encoded_wa_text}"
+
+    keyboard = [
+        [InlineKeyboardButton("📲 Share to WhatsApp", url=whatsapp_share_url)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Send Poll to Telegram Channel with WhatsApp Share Button
+    if TELEGRAM_CHANNEL_ID:
         try:
-            state = load_bot_state()
-            mode = state.get("mode", "MANUAL")
-            interval_mins = state.get("interval", 10)
-            
-            if mode == "AUTO":
-                posted = post_one_quiz()
-                if not posted:
-                    state["mode"] = "MANUAL"
-                    save_bot_state(state)
-            
-            time.sleep(interval_mins * 60)
+            await context.bot.send_poll(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                question=q_text,
+                options=opts,
+                type=Poll.QUIZ,
+                correct_option_id=correct,
+                reply_markup=reply_markup
+            )
+            return True
         except Exception as e:
-            print("Auto Post Error:", e)
-            time.sleep(60)
+            logger.error(f"Error posting poll to channel: {e}")
+            return False
+    return False
 
-def get_control_menu(chat_id, custom_msg="Control Panel:"):
-    state = load_bot_state()
-    mode = state.get("mode", "MANUAL")
-    interval = state.get("interval", 10)
-    q_list = load_queue()
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    auto_btn_text = "⏸️ Stop Auto Post" if mode == "AUTO" else "▶️ Start Auto Posting"
+    global is_auto_posting
     
-    control_menu = {
-        "inline_keyboard": [
-            [{"text": "📤 Post 1 Next Poll Now", "callback_data": "post_next"}],
-            [{"text": auto_btn_text, "callback_data": "toggle_auto"}],
-            [{"text": f"⏱️ Interval: {interval} Mins (Click to change)", "callback_data": "change_interval"}],
-            [{"text": "📊 Check Status", "callback_data": "status"}, {"text": "🗑️ Clear Queue", "callback_data": "clear"}]
-        ]
-    }
-    text = f"{custom_msg}\n\n🤖 Bot Mode: *{mode}*\n⏱️ Time Interval: *{interval} Minutes*\n📊 Total Queue: *{len(q_list)} Questions*"
-    send_tg_msg_with_buttons(chat_id, text, control_menu)
-
-def youtube_feed_listener():
-    if not YT_CHANNEL_ID:
-        return
-    last_video_id = None
-    while True:
-        try:
-            feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL_ID}"
-            feed = feedparser.parse(feed_url)
-            if feed.entries:
-                latest = feed.entries[0]
-                vid_id = latest.get("id", "")
-                if last_video_id is None:
-                    last_video_id = vid_id
-                elif vid_id != last_video_id:
-                    last_video_id = vid_id
-                    title = latest.get("title", "")
-                    link = latest.get("link", "")
-                    msg = f"📺 *Naya YouTube Video Upload Hua Hai!*\n\n*{title}*\n🔗 {link}\n\n📘 *Special Education Notes | 9828625119*"
-                    send_tg_channel_msg(msg)
-                    if WA_RECIPIENT_PHONE:
-                        send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, msg)
-        except Exception as e:
-            print("YouTube Feed Error:", e)
-        time.sleep(300)
-
-def telegram_file_listener():
-    if not BOT_TOKEN:
-        return
-    try:
-        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
-    except Exception as e:
-        print("Webhook Clear Error:", e)
-
-    offset = None
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            resp = requests.get(url, params={"timeout": 20, "offset": offset}, timeout=25).json()
+    if query.data == "post_one":
+        success = await send_next_quiz(context)
+        if success:
+            await query.edit_message_text(f"✅ Posted 1 poll to channel!\nRemaining in queue: {len(quiz_queue)}")
+        else:
+            await query.edit_message_text("⚠️ Queue is empty or TELEGRAM_CHANNEL_ID is not configured properly.")
             
-            for update in resp.get("result", []):
-                offset = update["update_id"] + 1
-                
-                if "callback_query" in update:
-                    cq = update["callback_query"]
-                    query_id = cq["id"]
-                    data = cq["data"]
-                    chat_id = cq["message"]["chat"]["id"]
-                    
-                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": query_id})
-                    
-                    if data == "post_next":
-                        posted = post_one_quiz()
-                        if posted:
-                            get_control_menu(chat_id, "✅ Poll post ho gaya hai!")
-                        else:
-                            send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle file bhejein.")
-                    elif data == "toggle_auto":
-                        state = load_bot_state()
-                        new_mode = "MANUAL" if state["mode"] == "AUTO" else "AUTO"
-                        state["mode"] = new_mode
-                        save_bot_state(state)
-                        msg_str = f"🚀 *Auto Posting Mode Chalu Ho Gaya!* (Har {state['interval']} minute mein 1 post)" if new_mode == "AUTO" else "⏸️ *Auto Posting Mode Band Kar Diya Gaya!*"
-                        get_control_menu(chat_id, msg_str)
-                    elif data == "change_interval":
-                        send_tg_msg(chat_id, "⏱️ Interval set karne ke liye type karein:\n`/setinterval 5` (5 minute ke liye)")
-                    elif data == "status":
-                        get_control_menu(chat_id, "📊 Current Queue Status:")
-                    elif data == "clear":
-                        save_queue([])
-                        get_control_menu(chat_id, "🗑️ Queue khali kar di gayi hai!")
-                    continue
-                
-                msg = update.get("message", {})
-                chat_id = msg.get("chat", {}).get("id")
-                text_msg = msg.get("text", "")
-                
-                if text_msg.startswith("/setinterval"):
-                    parts = text_msg.split()
-                    if len(parts) > 1 and parts[1].isdigit():
-                        mins = int(parts[1])
-                        state = load_bot_state()
-                        state["interval"] = mins
-                        save_bot_state(state)
-                        get_control_menu(chat_id, f"✅ Time interval successfully *{mins} minutes* set kar diya gaya hai!")
-                    else:
-                        send_tg_msg(chat_id, "⚠️ Sahi format use karein, jaise: `/setinterval 10`")
-                    continue
-                
-                if "document" in msg:
-                    doc = msg["document"]
-                    file_name = doc.get("file_name", "")
-                    file_id = doc["file_id"]
-                    
-                    f_info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}", timeout=10).json()
-                    file_path = f_info["result"]["file_path"]
-                    file_bytes = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=15).content
-                    
-                    full_text = ""
-                    if file_name.lower().endswith(".pdf"):
-                        send_tg_msg(chat_id, "⏳ *PDF mil gayi hai! Extract kiya ja raha hai...*")
-                        with open("temp_quiz.pdf", "wb") as f:
-                            f.write(file_bytes)
-                        full_text = extract_text_from_pdf("temp_quiz.pdf")
-                    elif file_name.lower().endswith(".docx"):
-                        send_tg_msg(chat_id, "⏳ *Word File mil gayi hai! Extract kiya ja raha hai...*")
-                        with open("temp_quiz.docx", "wb") as f:
-                            f.write(file_bytes)
-                        full_text = extract_text_from_docx("temp_quiz.docx")
-                        
-                    if full_text:
-                        new_mcqs = extract_mcqs_from_text(full_text)
-                        if new_mcqs:
-                            q_list = load_queue()
-                            q_list.extend(new_mcqs)
-                            save_queue(q_list)
-                            get_control_menu(chat_id, f"✅ *Success!* {len(new_mcqs)} Questions extract ho gaye hain.")
-                        else:
-                            send_tg_msg(chat_id, "⚠️ File mein standard format nahi mila.")
-                
-                elif text_msg in ["/start", "/menu", "/status"]:
-                    get_control_menu(chat_id, "👋 *Control Menu:*")
-                    
-        except Exception as e:
-            print("Listener Error:", e)
-            time.sleep(5)
+    elif query.data == "start_auto":
+        is_auto_posting = True
+        await query.edit_message_text("▶️ Auto posting started! Posting 1 poll every 5 minutes...")
+        # Start recurring job (e.g., every 300 seconds)
+        context.job_queue.run_repeating(auto_post_job, interval=300, first=1)
 
-if __name__ == "__main__":
-    threading.Thread(target=auto_posting_thread, daemon=True).start()
-    threading.Thread(target=youtube_feed_listener, daemon=True).start()
-    threading.Thread(target=telegram_file_listener, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    elif query.data == "stop_auto":
+        is_auto_posting = False
+        # Remove active jobs
+        jobs = context.job_queue.get_jobs_by_name("auto_quiz")
+        for job in jobs:
+            job.schedule_removal()
+        await query.edit_message_text("⏸ Auto posting stopped.")
+
+    elif query.data == "status":
+        await query.edit_message_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}")
+
+async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
+    global is_auto_posting, quiz_queue
+    if is_auto_posting and quiz_queue:
+        await send_next_quiz(context)
+
+def main():
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Run Telegram Bot
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
