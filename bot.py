@@ -13,6 +13,7 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "@special_education_needs")  # Aapka Telegram Channel
 
 WA_API_URL = os.environ.get("WA_API_URL", "")
 WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "")
@@ -27,7 +28,7 @@ def home():
     q_count = len(load_queue())
     return f"Bot is Running! Pending Questions in Queue: {q_count}"
 
-# App Notification Webhook (Aapki app se WhatsApp par notification bhejne ke liye)
+# App Notification Webhook (App se WhatsApp aur Telegram dono par notification bhejne ke liye)
 @app.route('/app-notification', methods=['POST'])
 def app_notification():
     try:
@@ -41,7 +42,8 @@ def app_notification():
             f"📘 *Special Education Notes | 9828625119*"
         )
         send_whatsapp_msg(formatted_msg)
-        return {"status": "success", "message": "Notification sent to WhatsApp!"}, 200
+        send_tg_channel_msg(formatted_msg)
+        return {"status": "success", "message": "Notification sent to WhatsApp and Telegram channel!"}, 200
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
@@ -66,6 +68,22 @@ def send_tg_msg(chat_id, text):
         requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
         print("Telegram Send Error:", e)
+
+def send_tg_channel_msg(text):
+    if BOT_TOKEN and TG_CHANNEL_ID:
+        send_tg_msg(TG_CHANNEL_ID, text)
+
+def send_tg_channel_poll(quiz):
+    if BOT_TOKEN and TG_CHANNEL_ID:
+        try:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll", json={
+                "chat_id": TG_CHANNEL_ID,
+                "question": quiz["question"][:290],
+                "options": quiz["options"],
+                "is_anonymous": True
+            }, timeout=10)
+        except Exception as e:
+            print("Telegram Channel Poll Error:", e)
 
 def send_whatsapp_msg(text):
     if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
@@ -148,7 +166,8 @@ def extract_mcqs_from_text(full_text):
             
     return extracted
 
-def post_to_whatsapp_channel(quiz):
+def post_to_channels(quiz):
+    # 1. WhatsApp Channel par Poll + Solution bhejna
     if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
         headers = {
             "Authorization": f"Bearer {WA_API_TOKEN}",
@@ -175,22 +194,19 @@ def post_to_whatsapp_channel(quiz):
         except Exception as e:
             print("WhatsApp API Error:", e)
 
-    if BOT_TOKEN and ADMIN_CHAT_ID:
+    # 2. Telegram Channel par Poll + Solution bhejna
+    if BOT_TOKEN and TG_CHANNEL_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll", json={
-                "chat_id": ADMIN_CHAT_ID,
-                "question": quiz["question"][:290],
-                "options": quiz["options"],
-                "is_anonymous": True
-            }, timeout=10)
+            send_tg_channel_poll(quiz)
+            time.sleep(2)
             sol_card = (
                 f"✅ *Answer:* {quiz['answer']}\n"
                 f"💡 *Solution:* {quiz['explanation']}\n"
                 f"📘 *Special Education Notes | 9828625119*"
             )
-            send_tg_msg(ADMIN_CHAT_ID, sol_card)
+            send_tg_channel_msg(sol_card)
         except Exception as e:
-            print("Telegram Admin Post Error:", e)
+            print("Telegram Channel Post Error:", e)
 
 def daily_20_scheduler():
     interval = int((16 * 3600) / DAILY_LIMIT)
@@ -200,7 +216,7 @@ def daily_20_scheduler():
             if queue:
                 next_quiz = queue.pop(0)
                 save_queue(queue)
-                post_to_whatsapp_channel(next_quiz)
+                post_to_channels(next_quiz)
         except Exception as e:
             print("Scheduler Error:", e)
         time.sleep(interval)
@@ -230,6 +246,7 @@ def youtube_feed_listener():
                         f"📘 *Special Education Notes | 9828625119*"
                     )
                     send_whatsapp_msg(msg)
+                    send_tg_channel_msg(msg)
         except Exception as e:
             print("YouTube Feed Error:", e)
         time.sleep(600)  # Har 10 minute mein check karega
