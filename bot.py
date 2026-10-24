@@ -244,6 +244,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
+    # Post Announcement to Channel
     await post_advance_announcement(exam_id, draft['subject'], draft['topic'], draft['sub_topic'], draft['sched_time'], len(parsed_qs))
 
     try:
@@ -264,7 +265,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
     global application
-    if not TELEGRAM_CHANNEL_ID or not application:
+    if not TELEGRAM_CHANNEL_ID:
+        logger.error("TELEGRAM_CHANNEL_ID is missing in environment variables!")
+        return
+    if not application:
+        logger.error("Telegram Application is not initialized!")
         return
 
     share_msg = (
@@ -294,25 +299,28 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
         f"📌 **सभी साथी ध्यान दें! परीक्षा का समय ऊपर दिया गया है। ज्यादा से ज्यादा लिंक को शेयर करें और नियत समय पर लाइव परीक्षा के लिए तैयार रहें!**"
     )
 
-    msg = await application.bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=announcement_text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
     try:
-        await application.bot.pin_chat_message(
+        msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            message_id=msg.message_id,
-            disable_notification=False
+            text=announcement_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
+        try:
+            await application.bot.pin_chat_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                message_id=msg.message_id,
+                disable_notification=False
+            )
+        except Exception as pin_err:
+            logger.error(f"Failed to pin message: {pin_err}")
     except Exception as e:
-        logger.error(f"Error pinning message: {e}")
+        logger.error(f"Failed to send announcement to channel {TELEGRAM_CHANNEL_ID}: {e}")
 
 async def post_exam_to_channel(exam_id):
     global application
     if not TELEGRAM_CHANNEL_ID or not application:
+        logger.error("TELEGRAM_CHANNEL_ID or application missing during live post!")
         return
 
     conn = sqlite3.connect("exam_system.db")
@@ -350,21 +358,23 @@ async def post_exam_to_channel(exam_id):
         f"👇 **नीचे दिए गए बटन से तुरंत परीक्षा शुरू करें:**"
     )
 
-    msg = await application.bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=post_text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
     try:
-        await application.bot.pin_chat_message(
+        msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            message_id=msg.message_id,
-            disable_notification=False
+            text=post_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
+        try:
+            await application.bot.pin_chat_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                message_id=msg.message_id,
+                disable_notification=False
+            )
+        except Exception as pin_err:
+            logger.error(f"Failed to pin live message: {pin_err}")
     except Exception as e:
-        logger.error(f"Error pinning live message: {e}")
+        logger.error(f"Failed to send live exam message to channel: {e}")
 
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     user = update.effective_user
@@ -586,7 +596,7 @@ async def setup_bot():
 
 @app.route('/')
 def home():
-    return "Pro Exam Bot with Auto Announcement & Pinning is Active!"
+    return "Pro Exam Bot with Error Logging is Active!"
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -614,4 +624,3 @@ if __name__ == '__main__':
     logger.info(f"Webhook connected: {webhook_url}")
 
     app.run(host="0.0.0.0", port=PORT)
-
