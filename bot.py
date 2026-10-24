@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import urllib.parse
 from datetime import datetime
-import pytZ
+import pytz
 from flask import Flask, request
 import docx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -658,7 +658,6 @@ def webhook():
     import asyncio
     update_json = request.get_json(force=True)
     
-    # Use the running loop safely without creating conflicting event loops
     loop = asyncio.get_event_loop()
     if loop.is_running():
         asyncio.run_coroutine_threadsafe(process_update_async(update_json), loop)
