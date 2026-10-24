@@ -16,10 +16,11 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "@special_education_needs")
 
-# Meta WhatsApp Cloud API Credentials
+# Meta WhatsApp Cloud API Credentials for Personal Number
 WA_PHONE_NUMBER_ID = os.environ.get("WA_PHONE_NUMBER_ID", "1297728493425237")
 WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "EAAUv4VEpbrQBSZCKoSZC65TyT8dXcYOS5xSvklIWathdVYSPLzMM1q0ZBRIYqStNrnpOFAc23SCwhBV7AFbg2L9Vgp16E0KU3solaNhcZBNhXkEWb2NE9HZBSA9GTiQU8uaJ8fAqv7cdEEzS1Uy6yVBwBe4ffH620JjL955xrl036NSUKKHYIFiQnn0g2qQZDZD")
-WA_RECIPIENT_PHONE = os.environ.get("WA_RECIPIENT_PHONE", "")
+# Yahan apna WhatsApp number dalein bina '+' ke, country code ke sath (jaise: 919828625119)
+WA_RECIPIENT_PHONE = os.environ.get("WA_RECIPIENT_PHONE", "919828625119")
 
 YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "")
 
@@ -138,6 +139,7 @@ def send_tg_channel_quiz(quiz):
             return res_json.get("description", "Unknown Error")
         return None
 
+# Meta WhatsApp Cloud API Message to Phone Number
 def send_meta_whatsapp_msg(to_phone, text):
     if WA_PHONE_NUMBER_ID and WA_API_TOKEN and to_phone:
         url = f"https://graph.facebook.com/v18.0/{WA_PHONE_NUMBER_ID}/messages"
@@ -228,22 +230,22 @@ def post_one_quiz():
     if BOT_TOKEN and TG_CHANNEL_ID:
         send_tg_channel_quiz(quiz)
 
-    # 2. WhatsApp Notification
+    # 2. WhatsApp Personal Number Message
     if WA_RECIPIENT_PHONE:
         wa_text = (
-            f"❓ *{quiz['question']}*\n"
+            f"❓ *{quiz['question']}*\n\n"
             f"a) {quiz['options'][0]}\n"
             f"b) {quiz['options'][1]}\n"
             f"c) {quiz['options'][2]}\n"
             f"d) {quiz['options'][3]}\n\n"
             f"✅ *Answer:* {quiz['answer']}\n"
-            f"💡 *Solution:* {quiz['explanation']}"
+            f"💡 *Solution:* {quiz['explanation']}\n\n"
+            f"📘 *Special Education Notes | 9828625119*"
         )
         send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, wa_text)
         
     return True
 
-# Auto Scheduler with Custom Time Interval
 def auto_posting_thread():
     while True:
         try:
@@ -334,7 +336,7 @@ def telegram_file_listener():
                     if data == "post_next":
                         posted = post_one_quiz()
                         if posted:
-                            get_control_menu(chat_id, "✅ Poll Telegram Channel par post ho gaya!")
+                            get_control_menu(chat_id, "✅ Poll post ho gaya hai!")
                         else:
                             send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle file bhejein.")
                     elif data == "toggle_auto":
@@ -345,7 +347,7 @@ def telegram_file_listener():
                         msg_str = f"🚀 *Auto Posting Mode Chalu Ho Gaya!* (Har {state['interval']} minute mein 1 post)" if new_mode == "AUTO" else "⏸️ *Auto Posting Mode Band Kar Diya Gaya!*"
                         get_control_menu(chat_id, msg_str)
                     elif data == "change_interval":
-                        send_tg_msg(chat_id, "⏱️ Interval set karne ke liye type karein:\n`/setinterval 5` (5 minute ke liye)\n`/setinterval 15` (15 minute ke liye)")
+                        send_tg_msg(chat_id, "⏱️ Interval set karne ke liye type karein:\n`/setinterval 5` (5 minute ke liye)")
                     elif data == "status":
                         get_control_menu(chat_id, "📊 Current Queue Status:")
                     elif data == "clear":
@@ -357,7 +359,6 @@ def telegram_file_listener():
                 chat_id = msg.get("chat", {}).get("id")
                 text_msg = msg.get("text", "")
                 
-                # Handle /setinterval command
                 if text_msg.startswith("/setinterval"):
                     parts = text_msg.split()
                     if len(parts) > 1 and parts[1].isdigit():
