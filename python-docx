@@ -1,0 +1,100 @@
+import os
+from flask import Flask, request
+import docx
+import requests
+
+app = Flask(__name__)
+
+# Meta WhatsApp API Credentials
+WA_TOKEN = os.environ.get("WA_API_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "129772849342537")
+WA_CHANNEL_ID = os.environ.get("WA_CHANNEL_ID")  # Aapka WhatsApp Channel ID
+
+WHATSAPP_API_URL = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+
+
+def parse_docx_questions(file_path):
+  doc = docx.Document(file_path)
+  questions_list = []
+  current_q = {}
+
+  for para in doc.paragraphs:
+    text = para.text.strip()
+    if not text:
+      continue
+
+    if text.startswith("Question:"):
+      if current_q:
+        questions_list.append(current_q)
+      current_q = {
+          "question": text.replace("Question:", "").strip(),
+          "options": [],
+          "answer": "",
+          "solution": "",
+      }
+    elif text.startswith(("(a)", "(b)", "(c)", "(d)")):
+      if "options" in current_q:
+        current_q["options"].append(text)
+    elif text.startswith("Answer:"):
+      current_q["answer"] = text.replace("Answer:", "").strip()
+    elif text.startswith("Solution:"):
+      current_q["solution"] = text.replace("Solution:", "").strip()
+
+  if current_q:
+    questions_list.append(current_q)
+
+  return questions_list
+
+
+def send_to_whatsapp(question_data):
+  # Message formatting for WhatsApp Channel
+  options_text = "\n".join(question_data["options"])
+  message_body = (
+      f"📚 *Special Education Quiz*\n\n"
+      f"❓ *Q:* {question_data['question']}\n\n"
+      f"{options_text}\n\n"
+      f"✅ *Answer:* {question_data['answer']}"
+  )
+
+  if question_data.get("solution"):
+    message_body += f"\n💡 *Solution:* {question_data['solution']}"
+
+  headers = {
+      "Authorization": f"Bearer {WA_TOKEN}",
+      "Content-Type": "application/json",
+  }
+
+  payload = {
+      "messaging_product": "whatsapp",
+      "to": WA_CHANNEL_ID,
+      "type": "text",
+      "text": {"body": message_body},
+  }
+
+  response = requests.post(WHATSAPP_API_URL, json=payload, headers=headers)
+  return response.json()
+
+
+@app.route("/upload-quiz", methods=["POST"])
+def upload_quiz():
+  # Jab aap docx file bhejenge
+  if "file" not in request.files:
+    return "No file uploaded", 400
+
+  file = request.files["file"]
+  file_path = f"/tmp/{file.filename}"
+  file.save(file_path)
+
+  parsed_questions = parse_docx_questions(file_path)
+
+  # Saare questions ko ek-ek karke WhatsApp channel par bhejna
+  results = []
+  for q in parsed_questions:
+    res = send_to_whatsapp(q)
+    results.append(res)
+
+  return f"Successfully sent {len(parsed_questions)} questions to WhatsApp Channel!"
+
+
+if __name__ == "__main__":
+  app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
