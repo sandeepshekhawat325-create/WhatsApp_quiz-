@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import urllib.parse
 from datetime import datetime
+import pytz
 from flask import Flask, request
 import docx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
@@ -17,31 +18,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Indian Timezone Setup (IST)
+IST = pytz.timezone('Asia/Kolkata')
+
 # Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+TELEGRAM_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID") or os.environ.get("TELEGRAM_CHANNEL_ID", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://whatsapp-quiz-pt5d.onrender.com")
 PORT = int(os.environ.get("PORT", 10000))
 
-# Flask App for Health Check and Webhook Handling
+# Flask App & Scheduler with IST timezone
 app = Flask(__name__)
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=IST)
 application = None
-
-# Helper function to parse 12-hour AM/PM or 24-hour time strings
-def parse_time_string(time_str):
-    time_str = time_str.strip()
-    formats = [
-        "%Y-%m-%d %I:%M %p",  # e.g., 2026-10-24 02:00 PM
-        "%Y-%m-%d %I:%M%p",   # e.g., 2026-10-24 2:00PM
-        "%Y-%m-%d %H:%M"      # Fallback for 24-hour format
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(time_str, fmt)
-        except ValueError:
-            continue
-    raise ValueError("Invalid time format")
 
 # ==========================================
 # DATABASE SETUP (SQLite)
@@ -188,7 +177,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"👋 नमस्ते {user.first_name}!\n\n"
+        f"👋 **नमस्ते {user.first_name}!**\n\n"
         "🏛 **Pro Exam & Live Ranking System Bot में आपका स्वागत है।**\n\n"
         "👨‍🏫 **Admin Panel:** /admin"
     )
@@ -208,13 +197,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     draft = admin_drafts.get(user_id)
     
-    if not draft or draft.get('action') != 'create':
-        await update.message.reply_text("⚠️ कृपया पहले /admin में जाकर 'Create New Exam Schedule' चुनें।")
+    if not draft or draft.get('action') != 'create' or draft.get('step') != 'file':
+        await update.message.reply_text("⚠️ कृपया पहले /admin से प्रक्रिया शुरू करें।")
         return
 
     document = update.message.document
     if not document.file_name.lower().endswith(('.docx', '.doc')):
-        await update.message.reply_text("❌ कृपया केवल `.docx` (Word) फ़ाइल ही भेजें[span_0](start_span)[span_0](end_span)!")
+        await update.message.reply_text("❌ कृपया केवल `.docx` (Word) फ़ाइल ही भेजें!")
         return
 
     file_obj = await document.get_file()
@@ -222,15 +211,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     parsed_qs = parse_docx_content(file_bytes)
     if not parsed_qs:
-        await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई। कृपया फ़ाइल का फॉर्मेट जांचें[span_1](start_span)[span_1](end_span)!")
+        await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई। फॉर्मेट जांचें!")
         return
 
+    sched_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}"
+    
     conn = sqlite3.connect("exam_system.db")
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO exams (subject, topic, sub_topic, time_per_q, scheduled_time, status)
         VALUES (?, ?, ?, ?, ?, 'SCHEDULED')
-    ''', (draft['subject'], draft['topic'], draft['sub_topic'], 30, draft['sched_time']))
+    ''', (draft['subject'], draft['topic'], draft['sub_topic'], 30, sched_time_str))
     
     exam_id = cursor.lastrowid
     
@@ -244,11 +235,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    # Post Announcement to Channel
-    await post_advance_announcement(exam_id, draft['subject'], draft['topic'], draft['sub_topic'], draft['sched_time'], len(parsed_qs))
+    await post_advance_announcement(exam_id, draft['subject'], draft['topic'], draft['sub_topic'], sched_time_str, len(parsed_qs))
 
     try:
-        run_time = parse_time_string(draft['sched_time'])
+        naive_dt = datetime.strptime(sched_time_str, "%Y-%m-%d %I:%M %p")
+        run_time = IST.localize(naive_dt)
         scheduler.add_job(
             post_exam_to_channel,
             'date',
@@ -263,40 +254,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del admin_drafts[user_id]
     await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट और पिन कर दी गई है!")
 
+# ==========================================
+# ADVANCED STYLISH ANNOUNCEMENT POST
+# ==========================================
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
     global application
-    if not TELEGRAM_CHANNEL_ID:
-        logger.error("TELEGRAM_CHANNEL_ID is missing in environment variables!")
-        return
-    if not application:
-        logger.error("Telegram Application is not initialized!")
+    if not TELEGRAM_CHANNEL_ID or not application:
         return
 
     share_msg = (
-        f"📢 *UPCOMING EXAM ANNOUNCEMENT*\n\n"
+        f"📢 *UPCOMING LIVE EXAM ANNOUNCEMENT*\n\n"
         f"📚 *Subject:* {subject}\n"
         f"📖 *Topic:* {topic}\n"
         f"📑 *Sub-Topic:* {sub_topic}\n"
         f"⏰ *Exam Time:* {sched_time}\n"
         f"❓ *Total Questions:* {total_q}\n\n"
-        f"📌 *Sabhi sathi jyada se jyada iss link se channel join karein aur WhatsApp par share karein!*"
+        f"🔥 *Jyada se jyada dosto ke sath share karein!*"
     )
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
 
-    keyboard = [
-        [InlineKeyboardButton("📲 Share Announcement to WhatsApp", url=wa_url)]
-    ]
+    keyboard = [[InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     announcement_text = (
-        f"📢 **UPCOMING EXAM ANNOUNCEMENT** 📢\n\n"
-        f"📚 **Subject:** {subject}\n"
-        f"📖 **Topic:** {topic}\n"
-        f"📑 **Sub-Topic:** {sub_topic}\n"
-        f"⏰ **Exam Start Time:** `{sched_time}`\n"
-        f"❓ **Total Questions:** {total_q}\n"
-        f"⏱ **Time Limit:** 30 Seconds / Question\n\n"
-        f"📌 **सभी साथी ध्यान दें! परीक्षा का समय ऊपर दिया गया है। ज्यादा से ज्यादा लिंक को शेयर करें और नियत समय पर लाइव परीक्षा के लिए तैयार रहें!**"
+        f"⚡ **══════════════════** ⚡\n"
+        f"📢 **UPCOMING EXAM ANNOUNCEMENT** 📢\n"
+        f"⚡ **══════════════════** ⚡\n\n"
+        f"📚 **विषय (Subject):** `{subject}`\n"
+        f"📖 **टॉपिक (Topic):** `{topic}`\n"
+        f"📑 **सब-टॉपिक (Sub-Topic):** `{sub_topic}`\n\n"
+        f"⏰ **परीक्षा का समय (Time):** 🗓 `{sched_time}`\n"
+        f"❓ **कुल प्रश्न (Total Questions):** `{total_q}`\n"
+        f"⏱ **समय सीमा (Timer):** `30 Sec / Question`\n"
+        f"🏆 **रैंकिंग (Leaderboard):** `Instant Live Rank`\n\n"
+        f"📌 **विशेष सूचना:**\n"
+        f"सर्वश्रेष्ठ प्रदर्शन के लिए नियत समय पर ऑनलाइन रहें! अपने दोस्तों को भी यह पोस्ट शेयर करके आमंत्रित करें। 🚀\n\n"
+        f"👇 **शेयर करने के लिए नीचे बटन पर क्लिक करें:**"
     )
 
     try:
@@ -306,21 +299,20 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-        try:
-            await application.bot.pin_chat_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                message_id=msg.message_id,
-                disable_notification=False
-            )
-        except Exception as pin_err:
-            logger.error(f"Failed to pin message: {pin_err}")
+        await application.bot.pin_chat_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            message_id=msg.message_id,
+            disable_notification=False
+        )
     except Exception as e:
-        logger.error(f"Failed to send announcement to channel {TELEGRAM_CHANNEL_ID}: {e}")
+        logger.error(f"Error in announcement/pin: {e}")
 
+# ==========================================
+# STYLISH LIVE EXAM POST
+# ==========================================
 async def post_exam_to_channel(exam_id):
     global application
     if not TELEGRAM_CHANNEL_ID or not application:
-        logger.error("TELEGRAM_CHANNEL_ID or application missing during live post!")
         return
 
     conn = sqlite3.connect("exam_system.db")
@@ -338,24 +330,27 @@ async def post_exam_to_channel(exam_id):
     bot_info = await application.bot.get_me()
     start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
     
-    share_msg = f"🎯 *LIVE EXAM STARTED*\n\n📚 *Subject:* {exam[0]}\n📖 *Topic:* {exam[1]}\n📑 *Sub-Topic:* {exam[2]}\n❓ *Total Questions:* {total_q}\n⏱ *Time Per Question:* 30 Sec\n\n👉 *Join & Give Test:* {start_link}"
+    share_msg = f"🔥 *LIVE EXAM IS STARTED NOW!*\n\n📚 *Subject:* {exam[0]}\n📖 *Topic:* {exam[1]}\n📑 *Sub-Topic:* {exam[2]}\n❓ *Total Questions:* {total_q}\n⏱ *Timer:* 30 Sec / Question\n\n👉 *Join Test Now:* {start_link}"
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
 
     keyboard = [
-        [InlineKeyboardButton("🚀 Start Exam Now (In Bot)", url=start_link)],
+        [InlineKeyboardButton("🚀 Start Live Exam Now (In Bot)", url=start_link)],
         [InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     post_text = (
-        f"🚀 **LIVE EXAM IS NOW STARTED!** 🚀\n\n"
-        f"📚 **Subject:** {exam[0]}\n"
-        f"📖 **Topic:** {exam[1]}\n"
-        f"📑 **Sub-Topic:** {exam[2]}\n"
-        f"❓ **Total Questions:** {total_q}\n"
-        f"⏱ **Time Limit:** 30 Seconds / Question\n"
-        f"🏆 **रैंकिंग एग्जाम खत्म होते ही तुरंत दिखाई जाएगी!**\n\n"
-        f"👇 **नीचे दिए गए बटन से तुरंत परीक्षा शुरू करें:**"
+        f"🔥 **══════════════════** 🔥\n"
+        f"🚀 **LIVE EXAM IS NOW STARTED!** 🚀\n"
+        f"🔥 **══════════════════** 🔥\n\n"
+        f"📚 **Subject:** `{exam[0]}`\n"
+        f"📖 **Topic:** `{exam[1]}`\n"
+        f"📑 **Sub-Topic:** `{exam[2]}`\n"
+        f"❓ **Total Questions:** `{total_q}`\n"
+        f"⏱ **Time Limit:** `30 Seconds / Question`\n"
+        f"🏆 **Live Leaderboard:** Instant Rank Generation\n\n"
+        f"⚡ **परीक्षा शुरू हो चुकी है! अपनी तैयारी परखें और अपनी लाइव रैंक देखें!**\n\n"
+        f"👇 **नीचे बटन पर क्लिक करके तुरंत टेस्ट शुरू करें:**"
     )
 
     try:
@@ -365,20 +360,44 @@ async def post_exam_to_channel(exam_id):
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-        try:
-            await application.bot.pin_chat_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                message_id=msg.message_id,
-                disable_notification=False
-            )
-        except Exception as pin_err:
-            logger.error(f"Failed to pin live message: {pin_err}")
+        await application.bot.pin_chat_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            message_id=msg.message_id,
+            disable_notification=False
+        )
     except Exception as e:
-        logger.error(f"Failed to send live exam message to channel: {e}")
+        logger.error(f"Error in live post/pin: {e}")
+
+def restore_jobs():
+    try:
+        conn = sqlite3.connect("exam_system.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, scheduled_time FROM exams WHERE status='SCHEDULED'")
+        exams = cursor.fetchall()
+        conn.close()
+
+        now = datetime.now(IST)
+        for exam in exams:
+            exam_id, sched_str = exam
+            try:
+                naive_dt = datetime.strptime(sched_str.strip(), "%Y-%m-%d %I:%M %p")
+                run_time = IST.localize(naive_dt)
+                job_id = f"exam_job_{exam_id}"
+                if run_time > now:
+                    scheduler.add_job(
+                        post_exam_to_channel,
+                        'date',
+                        run_date=run_time,
+                        args=[exam_id],
+                        id=job_id,
+                        replace_existing=True
+                    )
+            except Exception as ex:
+                logger.error(f"Could not restore job #{exam_id}: {ex}")
+    except Exception as e:
+        logger.error(f"Error in restore_jobs: {e}")
 
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
-    user = update.effective_user
-    
     conn = sqlite3.connect("exam_system.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt_id, pos_marks, neg_marks FROM questions WHERE exam_id=?", (exam_id,))
@@ -435,9 +454,9 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
             my_rank += 1
 
         result_text = (
-            f"🎉 **एग्जाम सफलतापूर्वक समाप्त हुआ!**\n\n"
-            f"📊 **आपका स्कोर:** `{final_score}`\n"
-            f"⏱ **कुल समय:** `{total_time} Seconds`\n"
+            f"🎉 **एग्जाम सफलतापूर्वक समाप्त हुआ!** 🎉\n\n"
+            f"📊 **आपका स्कोर (Score):** `{final_score}`\n"
+            f"⏱ **कुल समय (Total Time):** `{total_time} Seconds`\n"
             f"🏆 **आपकी रैंक (Your Rank):** `#{my_rank}`\n\n"
             f"🔄 यह एग्जाम री-अटेम्प्टेबल है, आप चाहें तो /start लिंक से इसे दोबारा भी दे सकते हैं!"
         )
@@ -489,7 +508,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         keyboard = []
-        txt = "📋 **Scheduled Exams (Schedule बदलने के लिए नीचे क्लिक करें):**\n\n"
+        txt = "📋 **Scheduled Exams:**\n\n"
         for r in rows:
             txt += f"• **Exam #{r[0]}**: {r[1]} - {r[2]} ({r[3]})\n"
             keyboard.append([InlineKeyboardButton(f"⏰ Reschedule Exam #{r[0]}", callback_data=f"resched_{r[0]}")])
@@ -500,127 +519,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("resched_"):
         exam_id = int(data.split("_")[1])
-        admin_drafts[user_id] = {'action': 'reschedule', 'exam_id': exam_id}
-        await query.edit_message_text(f"⏰ **Exam #{exam_id} के लिए नया समय दर्ज करें**\n\n(Format: `YYYY-MM-DD HH:MM AM/PM`, उदाहरण: `2026-10-24 02:00 PM`):")
+        admin_drafts[user_id] = {'action': 'reschedule_date', 'exam_id': exam_id}
+        await query.edit_message_text(f"📅 **Exam #{exam_id} के लिए नई तारीख लिखें**\n\n(Format: `YYYY-MM-DD`, उदाहरण: `2026-10-24`):")
         return
 
-    if data.startswith("ans_"):
-        parts = data.split("_")
-        ans_idx = int(parts[1])
-        q_idx = int(parts[2])
-        
-        exam_data = context.user_data.get('active_exam')
-        if exam_data and exam_data['current_index'] == q_idx:
-            current_q = exam_data['questions'][q_idx]
-            correct_idx = current_q[6]
-            pos_m = current_q[7]
-            neg_m = current_q[8]
-
-            if ans_idx == correct_idx:
-                exam_data['score'] += pos_m
-            else:
-                exam_data['score'] -= neg_m
-
-            exam_data['current_index'] += 1
-            await send_next_student_question(update, context)
-
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if user_id in admin_drafts:
-        draft = admin_drafts[user_id]
-        action = draft.get('action')
-
-        if action == 'reschedule':
-            exam_id = draft['exam_id']
-            try:
-                new_time_dt = parse_time_string(text)
-                
-                conn = sqlite3.connect("exam_system.db")
-                cursor = conn.cursor()
-                cursor.execute("UPDATE exams SET scheduled_time=? WHERE id=?", (text, exam_id))
-                conn.commit()
-                conn.close()
-
-                job_id = f"exam_job_{exam_id}"
-                if scheduler.get_job(job_id):
-                    scheduler.reschedule_job(job_id, trigger='date', run_date=new_time_dt)
-                else:
-                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[exam_id], id=job_id)
-
-                del admin_drafts[user_id]
-                await update.message.reply_text(f"✅ **Exam #{exam_id} का शेड्यूल सफलतापूर्वक बदलकर `{text}` कर दिया गया है!**")
-            except ValueError:
-                await update.message.reply_text("❌ गलत फॉर्मेट! कृपया सही AM/PM फॉर्मेट में लिखें (उदाहरण: `2026-10-24 02:00 PM`):")
+    elif data in ["set_am", "set_pm"]:
+        ampm_val = "AM" if data == "set_am" else "PM"
+        draft = admin_drafts.get(user_id)
+        if not draft:
             return
 
-        step = draft.get('step')
-        if step == 'subject':
-            draft['subject'] = text
-            draft['step'] = 'topic'
-            await update.message.reply_text("📖 **Topic का नाम लिखें:**")
-        elif step == 'topic':
-            draft['topic'] = text
-            draft['step'] = 'sub_topic'
-            await update.message.reply_text("📑 **Sub-Topic का नाम लिखें:**")
-        elif step == 'sub_topic':
-            draft['sub_topic'] = text
-            draft['step'] = 'sched_time'
-            await update.message.reply_text("⏰ **एग्जाम का समय दर्ज करें (Format: YYYY-MM-DD HH:MM AM/PM, उदाहरण: 2026-10-24 02:00 PM):**")
-        elif step == 'sched_time':
+        if draft.get('action') == 'create':
+            draft['ampm'] = ampm_val
+            draft['step'] = 'file'
+            await query.edit_message_text(f"📁 **समय सेट हो गया ({draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']})!**\n\nअब अपनी `.docx` प्रश्न फ़ाइल भेजें:")
+        elif draft.get('action') == 'reschedule_ampm':
+            exam_id = draft['exam_id']
+            new_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {ampm_val}"
             try:
-                parse_time_string(text)
-                draft['sched_time'] = text
-                draft['awaiting_file'] = True
-                await update.message.reply_text("📁 **अब अपनी `.docx` प्रश्न फ़ाइल भेजें[span_2](start_span)[span_2](end_span)!**")
-            except ValueError:
-                await update.message.reply_text("❌ गलत टाइम फॉर्मेट! कृपया AM/PM के साथ लिखें (उदाहरण: `2026-10-24 02:00 PM`):")
-
-# ==========================================
-# WEBHOOK SETUP
-# ==========================================
-async def setup_bot():
-    global application
-    if application is None:
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("admin", admin_panel))
-        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
-        application.add_handler(CallbackQueryHandler(button_callback))
-        
-        await application.initialize()
-    return application
-
-@app.route('/')
-def home():
-    return "Pro Exam Bot with Error Logging is Active!"
-
-@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
-def webhook():
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    update_json = request.get_json(force=True)
-    
-    async def process():
-        app_bot = await setup_bot()
-        update = Update.de_json(update_json, app_bot.bot)
-        await app_bot.process_update(update)
-
-    loop.run_until_complete(process())
-    return "OK", 200
-
-if __name__ == '__main__':
-    import asyncio
-    loop = asyncio.get_event_loop()
-    app_bot = loop.run_until_complete(setup_bot())
-    
-    scheduler.start()
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
-    loop.run_until_complete(app_bot.bot.set_webhook(url=webhook_url))
-    logger.info(f"Webhook connected: {webhook_url}")
-
-    app.run(host="0.0.0.0", port=PORT)
+                naive_dt = datetime.strptime
