@@ -1,25 +1,26 @@
-import os
+import asyncio
 import io
-import json
 import logging
+import os
 import sqlite3
+import threading
 import urllib.parse
 from datetime import datetime
-from typing import Optional
 
-import pytz
 import docx
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from flask import Flask, request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    PollAnswerHandler,
     filters,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------
 # Logging
@@ -28,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# Environment / Config
+# Timezone & config
 # ---------------------------
 IST = pytz.timezone("Asia/Kolkata")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -37,13 +38,16 @@ TELEGRAM_CHANNEL_USERNAME = os.environ.get("TG_CHANNEL_USERNAME") or os.environ.
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", 10000))
 
+# ---------------------------
+# Flask + scheduler
+# ---------------------------
 app = Flask(__name__)
 scheduler = AsyncIOScheduler(timezone=IST)
 application = None
 bot_loop = None
 
 # ---------------------------
-# DB helpers
+# DB
 # ---------------------------
 DB_PATH = "exam_system.db"
 
@@ -110,8 +114,7 @@ def init_db():
             total_time_sec INTEGER,
             total_questions INTEGER DEFAULT 0,
             correct_answers INTEGER DEFAULT 0,
-            submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(exam_id) REFERENCES exams(id)
+            submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -126,9 +129,36 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER,
+            question_id INTEGER,
+            poll_id TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER,
+            question_id INTEGER,
+            poll_id TEXT,
+            user_id INTEGER,
+            user_name TEXT,
+            selected_option TEXT,
+            is_correct INTEGER DEFAULT 0,
+            answered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
-
     ensure_default_settings()
 
 
@@ -159,9 +189,7 @@ def get_setting(key: str, default: str = "0") -> str:
     cursor = conn.cursor()
     row = cursor.execute("SELECT value FROM admin_settings WHERE key = ?", (key,)).fetchone()
     conn.close()
-    if row:
-        return row["value"]
-    return default
+    return row["value"] if row else default
 
 
 def set_setting(key: str, value: str):
@@ -173,6 +201,37 @@ def set_setting(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
+
+def is_show_voter_names() -> bool:
+    return get_setting("show_voter_names", "0") == "1"
+
+
+def is_multiple_allowed() -> bool:
+    return get_setting("allow_multiple_answers", "0") == "1"
+
+
+def is_shuffle_enabled() -> bool:
+    return get_setting("shuffle_options", "0") == "1"
+
+
+def is_quiz_mode() -> bool:
+    return get_setting("quiz_mode", "1") == "1"
+
+
+def is_explanation_enabled() -> bool:
+    return get_setting("show_explanations", "1") == "1"
+
+
+def is_channel_lock_enabled() -> bool:
+    return get_setting("channel_lock", "1") == "1"
+
+
+def get_timer_sec() -> int:
+    try:
+        return int(get_setting("timer_sec", "30"))
+    except Exception:
+        return 30
 
 
 init_db()
@@ -275,57 +334,26 @@ def parse_docx_content(file_bytes):
 
 
 # ---------------------------
-# Admin settings helpers
+# Admin UI
 # ---------------------------
-def is_quiz_mode_enabled() -> bool:
-    return get_setting("quiz_mode", "1") == "1"
-
-
-def is_anonymous_enabled() -> bool:
-    return get_setting("show_voter_names", "0") != "1"
-
-
-def is_multiple_allowed() -> bool:
-    return get_setting("allow_multiple_answers", "0") == "1"
-
-
-def is_shuffle_enabled() -> bool:
-    return get_setting("shuffle_options", "0") == "1"
-
-
-def is_explanation_enabled() -> bool:
-    return get_setting("show_explanations", "1") == "1"
-
-
-def is_channel_lock_enabled() -> bool:
-    return get_setting("channel_lock", "1") == "1"
-
-
-def get_timer_sec() -> int:
-    try:
-        return int(get_setting("timer_sec", "30"))
-    except Exception:
-        return 30
-
-
 def build_admin_message():
     return (
-        "⚙️ **ADMIN CONTROL PANEL**\n\n"
-        f"👁️ Show Who Voted: **{'ON' if is_anonymous_enabled() else 'OFF'}**\n"
+        "⚙️ *ADMIN CONTROL PANEL*\n\n"
+        f"👁️ Show Who Voted: **{'ON' if is_show_voter_names() else 'OFF'}**\n"
         f"☑️ Allow Multiple Answers: **{'ON' if is_multiple_allowed() else 'OFF'}**\n"
         f"🔀 Shuffle Options: **{'ON' if is_shuffle_enabled() else 'OFF'}**\n"
-        f"🧠 Quiz Mode: **{'ON' if is_quiz_mode_enabled() else 'OFF'}**\n"
-        f"💡 Show Explanations: **{'ON' if is_explanation_enabled() else 'OFF'}**\n"
+        f"🧠 Quiz Mode: **{'ON' if is_quiz_mode() else 'OFF'}**\n"
+        f"💡 Explanations: **{'ON' if is_explanation_enabled() else 'OFF'}**\n"
         f"🔒 Channel Lock: **{'ON' if is_channel_lock_enabled() else 'OFF'}**\n"
-        f"⏱️ Default Timer: `{get_timer_sec()} sec`"
+        f"⏱️ Timer: `{get_timer_sec()} sec`"
     )
 
 
-def make_admin_keyboard():
+def admin_keyboard():
     keyboard = [
         [
             InlineKeyboardButton(
-                f"👁️ Show Who Voted: {'ON' if is_anonymous_enabled() else 'OFF'}",
+                f"👁️ Show Who Voted: {'ON' if is_show_voter_names() else 'OFF'}",
                 callback_data="toggle_show_voter_names",
             )
         ],
@@ -343,7 +371,7 @@ def make_admin_keyboard():
         ],
         [
             InlineKeyboardButton(
-                f"🧠 Quiz Mode: {'ON' if is_quiz_mode_enabled() else 'OFF'}",
+                f"🧠 Quiz Mode: {'ON' if is_quiz_mode() else 'OFF'}",
                 callback_data="toggle_quiz_mode",
             )
         ],
@@ -360,7 +388,7 @@ def make_admin_keyboard():
             )
         ],
         [
-            InlineKeyboardButton("🆕 Create New Exam Schedule", callback_data="admin_create_exam"),
+            InlineKeyboardButton("🆕 Create New Exam", callback_data="admin_create_exam"),
             InlineKeyboardButton("📋 View Exams", callback_data="admin_view_exams"),
         ],
     ]
@@ -368,40 +396,7 @@ def make_admin_keyboard():
 
 
 # ---------------------------
-# Telegram helpers
-# ---------------------------
-def color_line(label: str, value: str, icon: str = "📌") -> str:
-    return f"{icon} **{label}:** `{value}`"
-
-
-async def ensure_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not is_channel_lock_enabled():
-        return True
-
-    user_id = update.effective_user.id
-    chat_id = TELEGRAM_CHANNEL_ID
-    if not chat_id:
-        return True
-
-    try:
-        member = await application.bot.get_chat_member(chat_id, user_id)
-        if member.status in ("member", "administrator", "creator"):
-            return True
-    except Exception:
-        pass
-
-    channel_link = f"https://t.me/{TELEGRAM_CHANNEL_USERNAME}" if TELEGRAM_CHANNEL_USERNAME else "https://t.me"
-    keyboard = [[InlineKeyboardButton("🔔 Join Channel First", url=channel_link)]]
-    await update.message.reply_text(
-        "🚫 **Access Restricted**\n\nYou must join the channel before taking this exam.\n\nTap below to join first.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-    return False
-
-
-# ---------------------------
-# Bot command handlers
+# Bot handlers
 # ---------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -409,12 +404,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args and args[0].startswith("exam_"):
         exam_id = int(args[0].split("_")[1])
-        if await ensure_subscription(update, context):
+        if await ensure_channel_access(update, context):
             await start_student_exam(update, context, exam_id)
         return
 
     await update.message.reply_text(
-        "🚀 **WELCOME TO THE QUIZ BOT** 🚀\n\n"
+        "🚀 *WELCOME TO THE QUIZ BOT* 🚀\n\n"
         f"👋 Namaste {user.first_name}!\n\n"
         "📚 Pro Quiz & Live Ranking Bot में आपका स्वागत है।\n\n"
         "⚙️ Admin Panel: `/admin`",
@@ -427,7 +422,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_drafts[user_id] = {}
     await update.message.reply_text(
         build_admin_message(),
-        reply_markup=make_admin_keyboard(),
+        reply_markup=admin_keyboard(),
         parse_mode="Markdown",
     )
 
@@ -440,20 +435,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ कृपया पहले /admin से प्रक्रिया शुरू करें।")
         return
 
-    document = update.message.document
-    if not document.file_name.lower().endswith((".docx", ".doc")):
-        await update.message.reply_text("❌ कृपया केवल `.docx` या `.doc` फ़ाइल भेजें।")
+    doc = update.message.document
+    if not doc.file_name.lower().endswith((".docx", ".doc")):
+        await update.message.reply_text("❌ कृपया केवल `.docx` या `.doc` फ़ाइल ही भेजें।")
         return
 
-    file_obj = await document.get_file()
-    file_bytes = await file_obj.download_as_bytearray()
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
     parsed_qs = parse_docx_content(file_bytes)
 
     if not parsed_qs:
-        await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई। फॉर्मेट जांचें।")
+        await update.message.reply_text("❌ फ़ाइल से प्रश्न नहीं पढ़े। फॉर्मेट जांचें।")
         return
 
-    sched_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}"
+    scheduled_time = f"{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}"
 
     conn = get_conn()
     cursor = conn.cursor()
@@ -471,16 +466,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             draft["topic"],
             draft["sub_topic"],
             get_timer_sec(),
-            sched_time_str,
-            "quiz" if is_quiz_mode_enabled() else "poll",
-            1 if is_anonymous_enabled() else 0,
+            scheduled_time,
+            "quiz" if is_quiz_mode() else "poll",
+            1 if is_show_voter_names() else 0,
             1 if is_multiple_allowed() else 0,
             1 if is_shuffle_enabled() else 0,
             get_timer_sec(),
             1 if is_channel_lock_enabled() else 0,
         ),
     )
-
     exam_id = cursor.lastrowid
 
     for q in parsed_qs:
@@ -516,12 +510,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draft["subject"],
         draft["topic"],
         draft["sub_topic"],
-        sched_time_str,
+        scheduled_time,
         len(parsed_qs),
     )
 
     try:
-        naive_dt = datetime.strptime(sched_time_str, "%Y-%m-%d %I:%M %p")
+        naive_dt = datetime.strptime(scheduled_time, "%Y-%m-%d %I:%M %p")
         run_time = IST.localize(naive_dt)
         scheduler.add_job(
             post_exam_to_channel,
@@ -536,14 +530,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_drafts.pop(user_id, None)
     await update.message.reply_text(
-        "✅ **EXAM SCHEDULE CREATED SUCCESSFULLY** ✅\n\n"
+        "✅ *EXAM CREATED SUCCESSFULLY* ✅\n\n"
         f"📚 Subject: `{draft['subject']}`\n"
-        f"🧠 Topic: `{draft['topic']}`\n"
+        f"📖 Topic: `{draft['topic']}`\n"
         f"📑 Sub-Topic: `{draft['sub_topic']}`\n"
-        f"⏱️ Schedule: `{sched_time_str}`\n"
-        f"❓ Questions: `{len(parsed_qs)}`",
+        f"⏰ Schedule: `{scheduled_time}`\n"
+        f"❓ Total Questions: `{len(parsed_qs)}`",
         parse_mode="Markdown",
     )
+
+
+async def ensure_channel_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not is_channel_lock_enabled():
+        return True
+
+    if not TELEGRAM_CHANNEL_ID:
+        return True
+
+    try:
+        member = await application.bot.get_chat_member(TELEGRAM_CHANNEL_ID, update.effective_user.id)
+        if member.status in ("member", "administrator", "creator"):
+            return True
+    except Exception:
+        pass
+
+    channel_link = f"https://t.me/{TELEGRAM_CHANNEL_USERNAME}" if TELEGRAM_CHANNEL_USERNAME else "https://t.me"
+    keyboard = [[InlineKeyboardButton("🔔 Join Channel", url=channel_link)]]
+    await update.message.reply_text(
+        "🚫 *Access Restricted*\n\nJoin the channel first before taking the exam.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+    return False
 
 
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
@@ -561,27 +579,26 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
     )
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
     keyboard = [[InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    announcement_text = (
-        "⚡ ══════════════════════ ⚡\n"
-        "📢  LIVE EXAM ANNOUNCEMENT  📢\n"
-        "⚡ ══════════════════════ ⚡\n\n"
+    text = (
+        "⚡ ═══════════════════════ ⚡\n"
+        "📢 LIVE EXAM ANNOUNCEMENT 📢\n"
+        "⚡ ═══════════════════════ ⚡\n\n"
         f"📚 Subject: `{subject}`\n"
         f"📖 Topic: `{topic}`\n"
         f"📑 Sub-Topic: `{sub_topic}`\n\n"
         f"⏰ Exam Time: `{sched_time}`\n"
         f"❓ Total Questions: `{total_q}`\n"
-        f"⏱️ Time Limit: `30 Sec / Question`\n"
-        f"🏆 Live Leaderboard: `Instant Rank Generation`\n\n"
-        "👇 Niche button par click karke invite share karein."
+        f"⏱️ Time Limit: `{get_timer_sec()} sec / Q`\n"
+        f"🏆 Leaderboard: `Live Rank`\n\n"
+        "👇 Share below."
     )
 
     try:
         msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=announcement_text,
-            reply_markup=reply_markup,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
         await application.bot.pin_chat_message(
@@ -590,42 +607,7 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
             disable_notification=False,
         )
     except Exception as e:
-        logger.exception("Error in channel announcement: %s", e)
-
-
-async def send_native_poll(exam_id: int):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt_id, explanation FROM questions WHERE exam_id=? ORDER BY id",
-        (exam_id,),
-    )
-    questions = cursor.fetchall()
-    conn.close()
-
-    if not questions:
-        return
-
-    first_q = questions[0]
-    options = [first_q["opt_a"], first_q["opt_b"], first_q["opt_c"], first_q["opt_d"]]
-    options = [o for o in options if o]
-
-    if not TELEGRAM_CHANNEL_ID or not application:
-        return
-
-    try:
-        await application.bot.send_poll(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            question=first_q["question_text"],
-            options=options,
-            is_anonymous=True,
-            type="quiz",
-            correct_option_id=first_q["correct_opt_id"],
-            explanation=first_q["explanation"] or "",
-            open_period=30,
-        )
-    except Exception as e:
-        logger.exception("Error in send_native_poll: %s", e)
+        logger.exception("Error in post_advance_announcement: %s", e)
 
 
 async def post_exam_to_channel(exam_id):
@@ -633,50 +615,56 @@ async def post_exam_to_channel(exam_id):
         return
 
     conn = get_conn()
-    row = conn.execute("SELECT subject, topic, sub_topic FROM exams WHERE id=?", (exam_id,)).fetchone()
-    total_q = conn.execute("SELECT COUNT(*) FROM questions WHERE exam_id=?", (exam_id,)).fetchone()[0]
+    exam = conn.execute(
+        "SELECT subject, topic, sub_topic, time_per_q FROM exams WHERE id=?",
+        (exam_id,),
+    ).fetchone()
+    questions = conn.execute(
+        "SELECT id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt_id, pos_marks, neg_marks, solution FROM questions WHERE exam_id=? ORDER BY id",
+        (exam_id,),
+    ).fetchall()
     conn.close()
 
-    if not row:
+    if not exam or not questions:
         return
 
     bot_info = await application.bot.get_me()
     start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
+
     share_msg = (
         f"🔥 *LIVE EXAM STARTED!*\n\n"
-        f"📚 *Subject:* {row['subject']}\n"
-        f"📖 *Topic:* {row['topic']}\n"
-        f"📑 *Sub-Topic:* {row['sub_topic']}\n"
-        f"❓ *Total Questions:* {total_q}\n"
-        f"⏱ *Timer:* 30 Sec / Question\n\n"
-        f"Join test now!"
+        f"📚 *Subject:* {exam['subject']}\n"
+        f"📖 *Topic:* {exam['topic']}\n"
+        f"📑 *Sub-Topic:* {exam['sub_topic']}\n"
+        f"❓ *Questions:* {len(questions)}\n"
+        f"⏱ *Timer:* {exam['time_per_q']} sec / Q\n\n"
+        "Start now!"
     )
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
 
+    announcement = (
+        "⚡ ═══════════════════════ ⚡\n"
+        "🚀 LIVE EXAM IS NOW STARTED! 🚀\n"
+        "⚡ ═══════════════════════ ⚡\n\n"
+        f"📚 Subject: `{exam['subject']}`\n"
+        f"📖 Topic: `{exam['topic']}`\n"
+        f"📑 Sub-Topic: `{exam['sub_topic']}`\n"
+        f"❓ Total Questions: `{len(questions)}`\n"
+        f"⏱️ Time Limit: `{exam['time_per_q']} sec / Q`\n"
+        "🏆 Leaderboard: `Instant Rank`\n\n"
+        "👇 Join now."
+    )
+
     keyboard = [
-        [InlineKeyboardButton("🚀 Start Live Exam Now (In Bot)", url=start_link)],
+        [InlineKeyboardButton("🚀 Start Live Exam Now", url=start_link)],
         [InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    post_text = (
-        "⚡ ══════════════════════ ⚡\n"
-        "📢  LIVE EXAM IS NOW STARTED!  📢\n"
-        "⚡ ══════════════════════ ⚡\n\n"
-        f"📚 Subject: `{row['subject']}`\n"
-        f"📖 Topic: `{row['topic']}`\n"
-        f"📑 Sub-Topic: `{row['sub_topic']}`\n"
-        f"❓ Total Questions: `{total_q}`\n"
-        f"⏱️ Time Limit: `30 Seconds / Question`\n"
-        f"🏆 Live Leaderboard: `Instant Rank Generation`\n\n"
-        "👇 Niche button par click karke abhi test start karein."
-    )
 
     try:
         msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=post_text,
-            reply_markup=reply_markup,
+            text=announcement,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
         await application.bot.pin_chat_message(
@@ -685,7 +673,108 @@ async def post_exam_to_channel(exam_id):
             disable_notification=False,
         )
     except Exception as e:
-        logger.exception("Error in live exam announcement: %s", e)
+        logger.exception("Error in live exam message: %s", e)
+
+    # Post each question as a native Telegram poll/quiz
+    for q in questions:
+        await send_channel_poll(exam_id, q["id"])
+
+    conn = get_conn()
+    conn.execute("UPDATE exams SET status='LIVE' WHERE id=?", (exam_id,))
+    conn.commit()
+    conn.close()
+
+
+async def send_channel_poll(exam_id, question_id):
+    if not TELEGRAM_CHANNEL_ID or not application:
+        return
+
+    conn = get_conn()
+    q = conn.execute(
+        "SELECT question_text, opt_a, opt_b, opt_c, opt_d, correct_opt_id, solution FROM questions WHERE id=? AND exam_id=?",
+        (question_id, exam_id),
+    ).fetchone()
+    conn.close()
+
+    if not q:
+        return
+
+    options = [q["opt_a"], q["opt_b"], q["opt_c"], q["opt_d"]]
+    options = [opt for opt in options if opt]
+
+    is_anonymous = not is_show_voter_names()
+    allow_multiple = is_multiple_allowed()
+    quiz_mode = is_quiz_mode()
+    explanation = q["solution"] if is_explanation_enabled() else None
+
+    try:
+        poll = await application.bot.send_poll(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            question=q["question_text"],
+            options=options,
+            is_anonymous=is_anonymous,
+            allows_multiple_answers=allow_multiple,
+            type="quiz" if quiz_mode else "regular",
+            correct_option_id=int(q["correct_opt_id"]) if quiz_mode else None,
+            explanation=explanation,
+            open_period=get_timer_sec(),
+        )
+
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO channel_polls (exam_id, question_id, poll_id) VALUES (?, ?, ?)",
+            (exam_id, question_id, poll.poll.id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception("Error while posting poll in channel: %s", e)
+
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll_answer = update.poll_answer
+    poll_id = poll_answer.poll_id
+    user_id = poll_answer.user.id
+    user_name = poll_answer.user.first_name or "User"
+    selected = poll_answer.option_ids
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT exam_id, question_id FROM channel_polls WHERE poll_id = ?",
+        (poll_id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return
+
+    q = conn.execute(
+        "SELECT correct_opt_id, pos_marks, neg_marks FROM questions WHERE id = ?",
+        (row["question_id"],),
+    ).fetchone()
+
+    if not q:
+        conn.close()
+        return
+
+    selected_option = ",".join(str(i) for i in selected)
+    is_correct = 0
+    if selected and int(selected[0]) == int(q["correct_opt_id"]):
+        is_correct = 1
+
+    conn.execute(
+        "INSERT INTO channel_answers (exam_id, question_id, poll_id, user_id, user_name, selected_option, is_correct) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            row["exam_id"],
+            row["question_id"],
+            poll_id,
+            user_id,
+            user_name,
+            selected_option,
+            is_correct,
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------
@@ -729,44 +818,18 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
         user = update.effective_user or update.callback_query.from_user
 
         conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO student_results (
-                exam_id, user_id, user_name, score, total_time_sec, total_questions, correct_answers
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                exam_data["exam_id"],
-                user.id,
-                user.first_name,
-                final_score,
-                total_time,
-                len(qs),
-                max(0, int(final_score)),
-            ),
+        conn.execute(
+            "INSERT INTO student_results (exam_id, user_id, user_name, score, total_time_sec, total_questions) VALUES (?, ?, ?, ?, ?, ?)",
+            (exam_data["exam_id"], user.id, user.first_name, final_score, total_time, len(qs)),
         )
         conn.commit()
-
-        rows = cursor.execute(
-            "SELECT user_name, score, total_time_sec FROM student_results WHERE exam_id=? ORDER BY score DESC, total_time_sec ASC",
-            (exam_data["exam_id"],),
-        ).fetchall()
         conn.close()
 
-        my_rank = 1
-        for r in rows:
-            if r["user_name"] == user.first_name and r["score"] == final_score:
-                break
-            my_rank += 1
-
         result_text = (
-            "🎉 **EXAM COMPLETED SUCCESSFULLY!** 🎉\n\n"
+            "🎉 **EXAM COMPLETED!** 🎉\n\n"
             f"📊 Score: `{final_score}`\n"
-            f"⏱️ Time Taken: `{total_time} Seconds`\n"
-            f"🏆 Your Rank: `#{my_rank}`\n\n"
-            "🔥 Keep pushing and improve your rank!"
+            f"⏱️ Time Taken: `{total_time} sec`\n\n"
+            "🔥 Good luck for the next round!"
         )
 
         if update.callback_query:
@@ -778,11 +841,11 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
         return
 
     q = qs[idx]
-    opts = [q["opt_a"], q["opt_b"], q["opt_c"], q["opt_d"]]
-    opts = [o for o in opts if o]
+    options = [q["opt_a"], q["opt_b"], q["opt_c"], q["opt_d"]]
+    options = [o for o in options if o]
 
     keyboard = []
-    for o_idx, o_text in enumerate(opts):
+    for o_idx, o_text in enumerate(options):
         keyboard.append([
             InlineKeyboardButton(f"{chr(65 + o_idx)}) {o_text}", callback_data=f"ans_{o_idx}_{idx}")
         ])
@@ -790,7 +853,7 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = (
         "🎯 **QUIZ QUESTION** 🎯\n\n"
-        f"📌 Question {idx+1}/{len(qs)}\n"
+        f"📌 Q {idx + 1}/{len(qs)}\n"
         f"⏱️ Timer: `{get_timer_sec()} sec`\n\n"
         f"{q['question_text']}"
     )
@@ -857,7 +920,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current = get_setting(key, "0")
             new_value = "1" if current != "1" else "0"
             set_setting(key, new_value)
-            await query.edit_message_text(build_admin_message(), reply_markup=make_admin_keyboard(), parse_mode="Markdown")
+            await query.edit_message_text(build_admin_message(), reply_markup=admin_keyboard(), parse_mode="Markdown")
         return
 
     if data in ["set_am", "set_pm"]:
@@ -873,27 +936,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📁 **Time Set**: `{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}`\n\nNow send your `.docx` file.",
                 parse_mode="Markdown",
             )
-        elif draft.get("action") == "reschedule_ampm":
-            exam_id = draft["exam_id"]
-            new_time = f"{draft['date']} {draft['hour']}:{draft['minute']} {ampm_val}"
-            conn = get_conn()
-            conn.execute("UPDATE exams SET scheduled_time=? WHERE id=?", (new_time, exam_id))
-            conn.commit()
-            conn.close()
-
-            job_id = f"exam_job_{exam_id}"
-            try:
-                naive_dt = datetime.strptime(new_time, "%Y-%m-%d %I:%M %p")
-                run_time = IST.localize(naive_dt)
-                if scheduler.get_job(job_id):
-                    scheduler.reschedule_job(job_id, trigger="date", run_date=run_time)
-                else:
-                    scheduler.add_job(post_exam_to_channel, "date", run_date=run_time, args=[exam_id], id=job_id)
-            except Exception:
-                logger.exception("Reschedule error")
-
-            admin_drafts.pop(user_id, None)
-            await query.edit_message_text(f"✅ Exam #{exam_id} का नया समय `{new_time}` (IST) सेट हो गया है.", parse_mode="Markdown")
         return
 
     if data.startswith("ans_"):
@@ -919,8 +961,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     text = update.message.text.strip()
+    user_id = update.effective_user.id
 
     if user_id not in admin_drafts:
         return
@@ -943,9 +985,10 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "reschedule_min":
         draft["minute"] = text.zfill(2)
         draft["action"] = "reschedule_ampm"
-        keyboard = [
-            [InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🌅 AM", callback_data="set_am"),
+            InlineKeyboardButton("🌇 PM", callback_data="set_pm"),
+        ]]
         await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
@@ -973,20 +1016,16 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     elif step == "minute":
         draft["minute"] = text.zfill(2)
         draft["step"] = "ampm"
-        keyboard = [
-            [InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("🌅 AM", callback_data="set_am"),
+            InlineKeyboardButton("🌇 PM", callback_data="set_pm"),
+        ]]
         await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
 # ---------------------------
-# Flask webhook setup
+# Webhook support
 # ---------------------------
-@app.route("/")
-def home():
-    return "Pro Quiz Bot Webhook is Active!"
-
-
 def dispatch_update(update_json):
     global application, bot_loop
     if not application or not bot_loop or not bot_loop.is_running():
@@ -1001,8 +1040,13 @@ def dispatch_update(update_json):
         future.result(timeout=12)
         return True
     except Exception:
-        logger.exception("Webhook update processing failed in bot loop")
+        logger.exception("Webhook update processing failed")
         return False
+
+
+@app.route("/")
+def home():
+    return "Pro Quiz Bot is Active!"
 
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
@@ -1021,12 +1065,16 @@ async def main_async():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(PollAnswerHandler(handle_poll_answer))
 
     await application.initialize()
     await application.bot.delete_webhook(drop_pending_updates=True)
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
-    await application.bot.set_webhook(url=webhook_url)
-    logger.info("Webhook connected successfully: %s", webhook_url)
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+        await application.bot.set_webhook(url=webhook_url)
+        logger.info("Webhook connected successfully: %s", webhook_url)
+    else:
+        logger.warning("RENDER_EXTERNAL_URL is empty; webhook not set.")
 
     scheduler.start()
     restore_jobs()
@@ -1039,36 +1087,32 @@ async def main_async():
 def restore_jobs():
     try:
         conn = get_conn()
-        exams = conn.execute("SELECT id, scheduled_time FROM exams WHERE status='SCHEDULED'").fetchall()
+        rows = conn.execute("SELECT id, scheduled_time FROM exams WHERE status='SCHEDULED'").fetchall()
         conn.close()
 
         now = datetime.now(IST)
-        for exam in exams:
-            exam_id = exam["id"]
-            sched_str = exam["scheduled_time"]
+        for row in rows:
+            exam_id = row["id"]
+            scheduled_time = row["scheduled_time"]
             try:
-                naive_dt = datetime.strptime(sched_str.strip(), "%Y-%m-%d %I:%M %p")
-                run_time = IST.localize(naive_dt)
-                job_id = f"exam_job_{exam_id}"
+                ct = datetime.strptime(scheduled_time.strip(), "%Y-%m-%d %I:%M %p")
+                run_time = IST.localize(ct)
                 if run_time > now:
                     scheduler.add_job(
                         post_exam_to_channel,
                         "date",
                         run_date=run_time,
                         args=[exam_id],
-                        id=job_id,
+                        id=f"exam_job_{exam_id}",
                         replace_existing=True,
                     )
-            except Exception as ex:
-                logger.exception("Could not restore job #%s: %s", exam_id, ex)
+            except Exception as e:
+                logger.exception("Could not restore job #%s: %s", exam_id, e)
     except Exception as e:
-        logger.exception("Error in restore_jobs: %s", e)
+        logger.exception("restore_jobs failed: %s", e)
 
 
 if __name__ == "__main__":
-    import asyncio
-    import threading
-
     def run_bot():
         global bot_loop
         bot_loop = asyncio.new_event_loop()
