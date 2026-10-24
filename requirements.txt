@@ -3,6 +3,6 @@ python-docx
 requests
 feedparser
 PyMuPDF
-gunicorn bot:app
+gunicorn 
 
 
