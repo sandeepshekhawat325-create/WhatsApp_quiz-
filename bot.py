@@ -633,7 +633,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ==========================================
-# FIXED SINGLE-LOOP WEBHOOK SETUP
+# THREAD-SAFE WEBHOOK SETUP
 # ==========================================
 async def setup_bot():
     global application
@@ -651,25 +651,29 @@ async def setup_bot():
 
 @app.route('/')
 def home():
-    return "Pro Exam Bot is Stable and Active!"
+    return "Pro Exam Bot is Fully Operational!"
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def webhook():
     import asyncio
     update_json = request.get_json(force=True)
     
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.run_coroutine_threadsafe(process_update_async(update_json), loop)
-    else:
-        loop.run_until_complete(process_update_async(update_json))
+    async def process():
+        app_bot = await setup_bot()
+        update = Update.de_json(update_json, app_bot.bot)
+        await app_bot.process_update(update)
+
+    # Safely run the async process in any thread context
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(process(), loop).result()
+        else:
+            loop.run_until_complete(process())
+    except RuntimeError:
+        asyncio.run(process())
         
     return "OK", 200
-
-async def process_update_async(update_json):
-    app_bot = await setup_bot()
-    update = Update.de_json(update_json, app_bot.bot)
-    await app_bot.process_update(update)
 
 if __name__ == '__main__':
     import asyncio
