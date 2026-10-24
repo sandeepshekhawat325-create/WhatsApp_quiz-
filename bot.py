@@ -543,7 +543,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if scheduler.get_job(job_id):
                     scheduler.reschedule_job(job_id, trigger='date', run_date=new_time_dt)
                 else:
-                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[context, exam_id], id=job_id)
+                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[context.application, exam_id], id=job_id)
 
                 del admin_drafts[user_id]
                 await query.edit_message_text(f"✅ **Exam #{exam_id} का नया समय `{new_time_str}` (IST) सफलतापूर्वक सेट कर दिया गया है!**")
@@ -624,7 +624,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).drop_pending_updates(True).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
@@ -635,8 +635,8 @@ def main():
     scheduler.start()
     restore_jobs(application)
     
-    # Run the bot using standard long polling (Most stable on Render, avoids webhooks & event loop errors)
-    application.run_polling()
+    # Run polling smoothly and clear any active webhooks or conflicts automatically
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
