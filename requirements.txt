@@ -1,4 +1,4 @@
-flask
+Flask
+python-docx
 requests
-PyMuPDF
 
