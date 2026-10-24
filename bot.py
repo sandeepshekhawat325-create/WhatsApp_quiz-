@@ -16,9 +16,11 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "@special_education_needs")
 
-WA_API_URL = os.environ.get("WA_API_URL", "")
-WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "")
-WA_CHANNEL_ID = os.environ.get("WA_CHANNEL_ID", "0029VbBrZUT6LwHeVGFnvl3Q@newsletter")
+# Meta WhatsApp Cloud API Credentials
+WA_PHONE_NUMBER_ID = os.environ.get("WA_PHONE_NUMBER_ID", "1297728493425237")
+WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "EAAUv4VEpbrQBSZCKoSZC65TyT8dXcYOS5xSvklIWathdVYSPLzMM1q0ZBRIYqStNrnpOFAc23SCwhBV7AFbg2L9Vgp16E0KU3solaNhcZBNhXkEWb2NE9HZBSA9GTiQU8uaJ8fAqv7cdEEzS1Uy6yVBwBe4ffH620JjL955xrl036NSUKKHYIFiQnn0g2qQZDZD")
+WA_RECIPIENT_PHONE = os.environ.get("WA_RECIPIENT_PHONE", "")
+
 YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "")
 
 QUEUE_FILE = "quiz_queue.json"
@@ -27,10 +29,9 @@ STATE_FILE = "bot_state.json"
 @app.route('/')
 def home():
     q_count = len(load_queue())
-    status = "RUNNING" if is_bot_active() else "PAUSED"
-    return f"Bot Status: {status} | Pending Questions in Queue: {q_count}"
+    state = load_bot_state()
+    return f"Bot Mode: {state.get('mode', 'MANUAL')} | Interval: {state.get('interval', 10)}m | Queue: {q_count}"
 
-# App Notification Webhook
 @app.route('/app-notification', methods=['POST'])
 def app_notification():
     try:
@@ -43,7 +44,8 @@ def app_notification():
             f"{notif_msg}\n\n"
             f"📘 *Special Education Notes | 9828625119*"
         )
-        send_whatsapp_msg(formatted_msg)
+        if WA_RECIPIENT_PHONE:
+            send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, formatted_msg)
         send_tg_channel_msg(formatted_msg)
         return {"status": "success", "message": "Notification sent!"}, 200
     except Exception as e:
@@ -62,18 +64,18 @@ def save_queue(data):
     with open(QUEUE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def is_bot_active():
+def load_bot_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f).get("active", True)
+                return json.load(f)
         except:
-            return True
-    return True
+            return {"mode": "MANUAL", "interval": 10}
+    return {"mode": "MANUAL", "interval": 10}
 
-def set_bot_active(state_bool):
+def save_bot_state(state_data):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"active": state_bool}, f)
+        json.dump(state_data, f)
 
 def send_tg_msg_with_buttons(chat_id, text, keyboard=None):
     if not BOT_TOKEN or not chat_id:
@@ -111,13 +113,12 @@ def get_correct_option_index(answer_str, options):
             return i
     return 0
 
-# Telegram Quiz Poll (Solution inside explanation)
 def send_tg_channel_quiz(quiz):
     if BOT_TOKEN and TG_CHANNEL_ID:
         correct_idx = get_correct_option_index(quiz["answer"], quiz["options"])
         explanation_text = (
-            f"✅ Sahi Uttar (Answer): {quiz['answer']}\n"
-            f"💡 Vyakhya (Solution): {quiz['explanation']}\n\n"
+            f"✅ Sahi Uttar: {quiz['answer']}\n"
+            f"💡 Solution: {quiz['explanation']}\n\n"
             f"📘 Special Education Notes | 9828625119"
         )
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
@@ -137,34 +138,24 @@ def send_tg_channel_quiz(quiz):
             return res_json.get("description", "Unknown Error")
         return None
 
-def send_whatsapp_msg(text):
-    if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
-        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
+def send_meta_whatsapp_msg(to_phone, text):
+    if WA_PHONE_NUMBER_ID and WA_API_TOKEN and to_phone:
+        url = f"https://graph.facebook.com/v18.0/{WA_PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WA_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to_phone,
+            "type": "text",
+            "text": {"body": text}
+        }
         try:
-            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": text}, timeout=15)
+            requests.post(url, headers=headers, json=payload, timeout=15)
         except Exception as e:
-            print("WhatsApp API Error:", e)
-
-def send_whatsapp_poll_with_solution(quiz):
-    if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
-        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
-        try:
-            poll_payload = {
-                "to": WA_CHANNEL_ID,
-                "title": f"❓ {quiz['question']}",
-                "options": quiz["options"][:10],
-                "count": 1
-            }
-            requests.post(f"{WA_API_URL}/messages/poll", headers=headers, json=poll_payload, timeout=15)
-            time.sleep(2)
-            sol_text = (
-                f"✅ *Sahi Uttar (Answer):* {quiz['answer']}\n"
-                f"💡 *Vyakhya (Solution):* {quiz['explanation']}\n\n"
-                f"📘 *Special Education Notes | 9828625119*"
-            )
-            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": sol_text}, timeout=15)
-        except Exception as e:
-            print("WhatsApp Poll/Text Error:", e)
+            print("Meta WA Error:", e)
 
 def extract_text_from_docx(docx_path):
     try:
@@ -225,49 +216,69 @@ def extract_mcqs_from_text(full_text):
             })
     return extracted
 
-def post_next_quiz_manually(chat_id):
-    if not is_bot_active():
-        send_tg_msg(chat_id, "🛑 Bot abhi **PAUSED** hai! Pehle '▶️ Resume Queue' par click karein[span_3](start_span)[span_3](end_span).")
-        return
-        
+def post_one_quiz():
     queue = load_queue()
     if not queue:
-        send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle koi file bhejein[span_4](start_span)[span_4](end_span).")
-        return
+        return False
     
     quiz = queue.pop(0)
     save_queue(queue)
     
-    # 1. WhatsApp Channel
-    send_whatsapp_poll_with_solution(quiz)
-
-    # 2. Telegram Channel Quiz Mode
-    tg_error = None
+    # 1. Telegram Channel Quiz
     if BOT_TOKEN and TG_CHANNEL_ID:
-        err = send_tg_channel_quiz(quiz)
-        if err:
-            tg_error = err
+        send_tg_channel_quiz(quiz)
 
-    if tg_error:
-        send_tg_msg(chat_id, f"❌ Telegram Error: `{tg_error}`\n*(Kripya check karein ki bot channel par Administrator hai ya nahi!)*")
-    else:
-        remaining = len(queue)
-        get_control_menu(chat_id, f"✅ Poll aur Solution successfully post ho gaye hain!\n📊 Baaki Queue: *{remaining} Questions*")
+    # 2. WhatsApp Notification
+    if WA_RECIPIENT_PHONE:
+        wa_text = (
+            f"❓ *{quiz['question']}*\n"
+            f"a) {quiz['options'][0]}\n"
+            f"b) {quiz['options'][1]}\n"
+            f"c) {quiz['options'][2]}\n"
+            f"d) {quiz['options'][3]}\n\n"
+            f"✅ *Answer:* {quiz['answer']}\n"
+            f"💡 *Solution:* {quiz['explanation']}"
+        )
+        send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, wa_text)
+        
+    return True
+
+# Auto Scheduler with Custom Time Interval
+def auto_posting_thread():
+    while True:
+        try:
+            state = load_bot_state()
+            mode = state.get("mode", "MANUAL")
+            interval_mins = state.get("interval", 10)
+            
+            if mode == "AUTO":
+                posted = post_one_quiz()
+                if not posted:
+                    state["mode"] = "MANUAL"
+                    save_bot_state(state)
+            
+            time.sleep(interval_mins * 60)
+        except Exception as e:
+            print("Auto Post Error:", e)
+            time.sleep(60)
 
 def get_control_menu(chat_id, custom_msg="Control Panel:"):
-    active = is_bot_active()
-    status_str = "🟢 Active" if active else "🔴 Paused"
+    state = load_bot_state()
+    mode = state.get("mode", "MANUAL")
+    interval = state.get("interval", 10)
     q_list = load_queue()
-    toggle_btn = {"text": "⏸️ Pause Queue", "callback_data": "pause"} if active else {"text": "▶️ Resume Queue", "callback_data": "resume"}
+    
+    auto_btn_text = "⏸️ Stop Auto Post" if mode == "AUTO" else "▶️ Start Auto Posting"
     
     control_menu = {
         "inline_keyboard": [
-            [{"text": "📤 Post Next Poll Now", "callback_data": "post_next"}],
-            [toggle_btn],
+            [{"text": "📤 Post 1 Next Poll Now", "callback_data": "post_next"}],
+            [{"text": auto_btn_text, "callback_data": "toggle_auto"}],
+            [{"text": f"⏱️ Interval: {interval} Mins (Click to change)", "callback_data": "change_interval"}],
             [{"text": "📊 Check Status", "callback_data": "status"}, {"text": "🗑️ Clear Queue", "callback_data": "clear"}]
         ]
     }
-    text = f"{custom_msg}\n\n🤖 Bot Status: *{status_str}*\n📊 Total Queue: *{len(q_list)} Questions*"
+    text = f"{custom_msg}\n\n🤖 Bot Mode: *{mode}*\n⏱️ Time Interval: *{interval} Minutes*\n📊 Total Queue: *{len(q_list)} Questions*"
     send_tg_msg_with_buttons(chat_id, text, control_menu)
 
 def youtube_feed_listener():
@@ -288,8 +299,9 @@ def youtube_feed_listener():
                     title = latest.get("title", "")
                     link = latest.get("link", "")
                     msg = f"📺 *Naya YouTube Video Upload Hua Hai!*\n\n*{title}*\n🔗 {link}\n\n📘 *Special Education Notes | 9828625119*"
-                    send_whatsapp_msg(msg)
                     send_tg_channel_msg(msg)
+                    if WA_RECIPIENT_PHONE:
+                        send_meta_whatsapp_msg(WA_RECIPIENT_PHONE, msg)
         except Exception as e:
             print("YouTube Feed Error:", e)
         time.sleep(300)
@@ -320,13 +332,20 @@ def telegram_file_listener():
                     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": query_id})
                     
                     if data == "post_next":
-                        post_next_quiz_manually(chat_id)
-                    elif data == "pause":
-                        set_bot_active(False)
-                        get_control_menu(chat_id, "⏸️ *Queue Rok Di Gayi Hai!*")
-                    elif data == "resume":
-                        set_bot_active(True)
-                        get_control_menu(chat_id, "▶️ *Queue Wapas Chalu Ho Gayi Hai!*")
+                        posted = post_one_quiz()
+                        if posted:
+                            get_control_menu(chat_id, "✅ Poll Telegram Channel par post ho gaya!")
+                        else:
+                            send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle file bhejein.")
+                    elif data == "toggle_auto":
+                        state = load_bot_state()
+                        new_mode = "MANUAL" if state["mode"] == "AUTO" else "AUTO"
+                        state["mode"] = new_mode
+                        save_bot_state(state)
+                        msg_str = f"🚀 *Auto Posting Mode Chalu Ho Gaya!* (Har {state['interval']} minute mein 1 post)" if new_mode == "AUTO" else "⏸️ *Auto Posting Mode Band Kar Diya Gaya!*"
+                        get_control_menu(chat_id, msg_str)
+                    elif data == "change_interval":
+                        send_tg_msg(chat_id, "⏱️ Interval set karne ke liye type karein:\n`/setinterval 5` (5 minute ke liye)\n`/setinterval 15` (15 minute ke liye)")
                     elif data == "status":
                         get_control_menu(chat_id, "📊 Current Queue Status:")
                     elif data == "clear":
@@ -336,6 +355,20 @@ def telegram_file_listener():
                 
                 msg = update.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
+                text_msg = msg.get("text", "")
+                
+                # Handle /setinterval command
+                if text_msg.startswith("/setinterval"):
+                    parts = text_msg.split()
+                    if len(parts) > 1 and parts[1].isdigit():
+                        mins = int(parts[1])
+                        state = load_bot_state()
+                        state["interval"] = mins
+                        save_bot_state(state)
+                        get_control_menu(chat_id, f"✅ Time interval successfully *{mins} minutes* set kar diya gaya hai!")
+                    else:
+                        send_tg_msg(chat_id, "⚠️ Sahi format use karein, jaise: `/setinterval 10`")
+                    continue
                 
                 if "document" in msg:
                     doc = msg["document"]
@@ -368,7 +401,7 @@ def telegram_file_listener():
                         else:
                             send_tg_msg(chat_id, "⚠️ File mein standard format nahi mila.")
                 
-                elif msg.get("text") in ["/start", "/menu", "/status"]:
+                elif text_msg in ["/start", "/menu", "/status"]:
                     get_control_menu(chat_id, "👋 *Control Menu:*")
                     
         except Exception as e:
@@ -376,7 +409,7 @@ def telegram_file_listener():
             time.sleep(5)
 
 if __name__ == "__main__":
+    threading.Thread(target=auto_posting_thread, daemon=True).start()
     threading.Thread(target=youtube_feed_listener, daemon=True).start()
     threading.Thread(target=telegram_file_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
-    
