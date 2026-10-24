@@ -29,22 +29,6 @@ def home():
     status = "RUNNING" if is_bot_active() else "PAUSED"
     return f"Bot Status: {status} | Pending Questions in Queue: {q_count}"
 
-# Bot State (Active / Paused) Handle Karne Ka Logic
-def is_bot_active():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("active", True)
-        except:
-            return True
-    return True
-
-def set_bot_active(state_bool):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"active": state_bool}, f)
-
-# App Notification Webhook (Instant WhatsApp & Telegram Notification)
 @app.route('/app-notification', methods=['POST'])
 def app_notification():
     try:
@@ -59,7 +43,7 @@ def app_notification():
         )
         send_whatsapp_msg(formatted_msg)
         send_tg_channel_msg(formatted_msg)
-        return {"status": "success", "message": "Notification sent to WhatsApp and Telegram!"}, 200
+        return {"status": "success", "message": "Notification sent!"}, 200
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
 
@@ -76,15 +60,24 @@ def save_queue(data):
     with open(QUEUE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def is_bot_active():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("active", True)
+        except:
+            return True
+    return True
+
+def set_bot_active(state_bool):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"active": state_bool}, f)
+
 def send_tg_msg_with_buttons(chat_id, text, keyboard=None):
     if not BOT_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if keyboard:
         payload["reply_markup"] = json.dumps(keyboard)
     try:
@@ -95,59 +88,57 @@ def send_tg_msg_with_buttons(chat_id, text, keyboard=None):
 def send_tg_msg(chat_id, text):
     send_tg_msg_with_buttons(chat_id, text)
 
+# Telegram Channel par message bhejne ka function with error check
 def send_tg_channel_msg(text):
     if BOT_TOKEN and TG_CHANNEL_ID:
-        send_tg_msg(TG_CHANNEL_ID, text)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={"chat_id": TG_CHANNEL_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        res_json = resp.json()
+        if not res_json.get("ok"):
+            print("TG Msg Error:", res_json)
+            return res_json.get("description", "Unknown Error")
+        return None
 
+# Telegram Channel par poll bhejne ka function with error check
 def send_tg_channel_poll(quiz):
     if BOT_TOKEN and TG_CHANNEL_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll", json={
-                "chat_id": TG_CHANNEL_ID,
-                "question": quiz["question"][:290],
-                "options": quiz["options"],
-                "is_anonymous": True
-            }, timeout=10)
-        except Exception as e:
-            print("Telegram Channel Poll Error:", e)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
+        resp = requests.post(url, json={
+            "chat_id": TG_CHANNEL_ID,
+            "question": quiz["question"][:290],
+            "options": quiz["options"],
+            "is_anonymous": True
+        }, timeout=10)
+        res_json = resp.json()
+        if not res_json.get("ok"):
+            print("TG Poll Error:", res_json)
+            return res_json.get("description", "Unknown Error")
+        return None
 
 def send_whatsapp_msg(text):
     if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
-        headers = {
-            "Authorization": f"Bearer {WA_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
         try:
-            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={
-                "to": WA_CHANNEL_ID,
-                "body": text
-            }, timeout=15)
+            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": text}, timeout=15)
         except Exception as e:
             print("WhatsApp API Error:", e)
 
-# DOCX file read
 def extract_text_from_docx(docx_path):
     try:
         doc = Document(docx_path)
-        full_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-        return full_text
+        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
     except Exception as e:
         print("DOCX Read Error:", e)
         return ""
 
-# PDF file read
 def extract_text_from_pdf(pdf_path):
     try:
         doc = pymupdf.open(pdf_path)
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text("text") + "\n"
-        return full_text
+        return "".join([page.get_text("text") + "\n" for page in doc])
     except Exception as e:
         print("PDF Read Error:", e)
         return ""
 
-# MCQ Parser (Supports unlimited questions at once)
 def extract_mcqs_from_text(full_text):
     blocks = re.split(r'\n(?=Question:|\bQ\.?\s*\d+|\b\d+[\.\)]|प्रश्न\s*\d+)', full_text)
     extracted = []
@@ -189,10 +180,8 @@ def extract_mcqs_from_text(full_text):
                 "answer": answer,
                 "explanation": explanation
             })
-            
     return extracted
 
-# Quiz Posting Logic
 def post_next_quiz_manually(chat_id):
     if not is_bot_active():
         send_tg_msg(chat_id, "🛑 Bot abhi **PAUSED** hai! Pehle '▶️ Resume Queue' par click karein.")
@@ -200,61 +189,46 @@ def post_next_quiz_manually(chat_id):
         
     queue = load_queue()
     if not queue:
-        send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle koi PDF ya DOCX file bhejein.")
+        send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle koi file bhejein.")
         return
     
     quiz = queue.pop(0)
     save_queue(queue)
     
-    # 1. WhatsApp Channel
+    # WhatsApp Post
     if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
-        headers = {
-            "Authorization": f"Bearer {WA_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        poll_payload = {
-            "to": WA_CHANNEL_ID,
-            "title": f"❓ {quiz['question']}",
-            "options": quiz["options"],
-            "count": 1
-        }
+        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
         try:
-            requests.post(f"{WA_API_URL}/messages/poll", headers=headers, json=poll_payload, timeout=15)
+            requests.post(f"{WA_API_URL}/messages/poll", headers=headers, json={"to": WA_CHANNEL_ID, "title": f"❓ {quiz['question']}", "options": quiz["options"], "count": 1}, timeout=15)
             time.sleep(2)
-            sol_text = (
-                f"✅ *सही उत्तर (Answer):* {quiz['answer']}\n"
-                f"💡 *व्याख्या (Solution):* {quiz['explanation']}\n\n"
-                f"📘 *Special Education Notes | 9828625119*"
-            )
-            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={
-                "to": WA_CHANNEL_ID,
-                "body": sol_text
-            }, timeout=15)
+            sol_text = f"✅ *सही उत्तर:* {quiz['answer']}\n💡 *व्याख्या:* {quiz['explanation']}\n\n📘 *Special Education Notes | 9828625119*"
+            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": sol_text}, timeout=15)
         except Exception as e:
             print("WhatsApp API Error:", e)
 
-    # 2. Telegram Channel
+    # Telegram Channel Post with Error Catching
+    tg_error = None
     if BOT_TOKEN and TG_CHANNEL_ID:
-        try:
-            send_tg_channel_poll(quiz)
+        err1 = send_tg_channel_poll(quiz)
+        if err1:
+            tg_error = err1
+        else:
             time.sleep(2)
-            sol_card = (
-                f"✅ *Answer:* {quiz['answer']}\n"
-                f"💡 *Solution:* {quiz['explanation']}\n"
-                f"📘 *Special Education Notes | 9828625119*"
-            )
-            send_tg_channel_msg(sol_card)
-        except Exception as e:
-            print("Telegram Channel Post Error:", e)
-            
-    remaining = len(queue)
-    get_control_menu(chat_id, f"✅ Poll successfully post ho gaya hai!\n📊 Baaki Queue: *{remaining} Questions*")
+            sol_card = f"✅ *Answer:* {quiz['answer']}\n💡 *Solution:* {quiz['explanation']}\n📘 *Special Education Notes | 9828625119*"
+            err2 = send_tg_channel_msg(sol_card)
+            if err2:
+                tg_error = err2
+
+    if tg_error:
+        send_tg_msg(chat_id, f"❌ Telegram Error: `{tg_error}`\n*(Kripya check karein ki bot channel par Administrator hai ya nahi!)*")
+    else:
+        remaining = len(queue)
+        get_control_menu(chat_id, f"✅ Poll successfully post ho gaya hai!\n📊 Baaki Queue: *{remaining} Questions*")
 
 def get_control_menu(chat_id, custom_msg="Control Panel:"):
     active = is_bot_active()
     status_str = "🟢 Active" if active else "🔴 Paused"
     q_list = load_queue()
-    
     toggle_btn = {"text": "⏸️ Pause Queue", "callback_data": "pause"} if active else {"text": "▶️ Resume Queue", "callback_data": "resume"}
     
     control_menu = {
@@ -264,15 +238,9 @@ def get_control_menu(chat_id, custom_msg="Control Panel:"):
             [{"text": "📊 Check Status", "callback_data": "status"}, {"text": "🗑️ Clear Queue", "callback_data": "clear"}]
         ]
     }
-    
-    text = (
-        f"{custom_msg}\n\n"
-        f"🤖 Bot Status: *{status_str}*\n"
-        f"📊 Total Queue: *{len(q_list)} Questions*"
-    )
+    text = f"{custom_msg}\n\n🤖 Bot Status: *{status_str}*\n📊 Total Queue: *{len(q_list)} Questions*"
     send_tg_msg_with_buttons(chat_id, text, control_menu)
 
-# YouTube RSS feed listener
 def youtube_feed_listener():
     if not YT_CHANNEL_ID:
         return
@@ -290,19 +258,13 @@ def youtube_feed_listener():
                     last_video_id = vid_id
                     title = latest.get("title", "")
                     link = latest.get("link", "")
-                    msg = (
-                        f"📺 *Naya YouTube Video Upload Hua Hai!*\n\n"
-                        f"*{title}*\n"
-                        f"🔗 {link}\n\n"
-                        f"📘 *Special Education Notes | 9828625119*"
-                    )
+                    msg = f"📺 *Naya YouTube Video Upload Hua Hai!*\n\n*{title}*\n🔗 {link}\n\n📘 *Special Education Notes | 9828625119*"
                     send_whatsapp_msg(msg)
                     send_tg_channel_msg(msg)
         except Exception as e:
             print("YouTube Feed Error:", e)
-        time.sleep(300) # Har 5 minute me YouTube check karega
+        time.sleep(300)
 
-# Telegram Listener
 def telegram_file_listener():
     if not BOT_TOKEN:
         return
@@ -320,7 +282,6 @@ def telegram_file_listener():
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
                 
-                # Callback Queries (Buttons)
                 if "callback_query" in update:
                     cq = update["callback_query"]
                     query_id = cq["id"]
@@ -333,15 +294,15 @@ def telegram_file_listener():
                         post_next_quiz_manually(chat_id)
                     elif data == "pause":
                         set_bot_active(False)
-                        get_control_menu(chat_id, "⏸️ *Queue Rok Di Gayi Hai!* Ab koi automatic ya manual post tab tak nahi jayega jab tak aap Resume nahi karte.")
+                        get_control_menu(chat_id, "⏸️ *Queue Rok Di Gaya Hai!*")
                     elif data == "resume":
                         set_bot_active(True)
                         get_control_menu(chat_id, "▶️ *Queue Wapas Chalu Ho Gayi Hai!*")
                     elif data == "status":
-                        get_control_menu(chat_id, "📊 Current Queue Status Update:")
+                        get_control_menu(chat_id, "📊 Current Queue Status:")
                     elif data == "clear":
                         save_queue([])
-                        get_control_menu(chat_id, "🗑️ Queue poori tarah khali kar di gayi hai!")
+                        get_control_menu(chat_id, "🗑️ Queue khali kar di gayi hai!")
                     continue
                 
                 msg = update.get("message", {})
@@ -358,13 +319,12 @@ def telegram_file_listener():
                     
                     full_text = ""
                     if file_name.lower().endswith(".pdf"):
-                        send_tg_msg(chat_id, "⏳ *PDF mil gayi hai! Sabhi questions extract kiye ja rahe hain...*")
+                        send_tg_msg(chat_id, "⏳ *PDF mil gayi hai! Extract kiya ja raha hai...*")
                         with open("temp_quiz.pdf", "wb") as f:
                             f.write(file_bytes)
                         full_text = extract_text_from_pdf("temp_quiz.pdf")
-                        
                     elif file_name.lower().endswith(".docx"):
-                        send_tg_msg(chat_id, "⏳ *Word File (.docx) mil gayi hai! Sabhi questions extract kiye ja rahe hain...*")
+                        send_tg_msg(chat_id, "⏳ *Word File mil gayi hai! Extract kiya ja raha hai...*")
                         with open("temp_quiz.docx", "wb") as f:
                             f.write(file_bytes)
                         full_text = extract_text_from_docx("temp_quiz.docx")
@@ -375,16 +335,12 @@ def telegram_file_listener():
                             q_list = load_queue()
                             q_list.extend(new_mcqs)
                             save_queue(q_list)
-                            
-                            get_control_menu(
-                                chat_id,
-                                f"✅ *Success!* File se kul *{len(new_mcqs)} Questions* safaltapoorvak extract ho gaye hain."
-                            )
+                            get_control_menu(chat_id, f"✅ *Success!* {len(new_mcqs)} Questions extract ho gaye hain.")
                         else:
-                            send_tg_msg(chat_id, "⚠️ File mein standard format (Question: / (a) (b) (c) (d) / Answer:) nahi mila.")
+                            send_tg_msg(chat_id, "⚠️ File mein standard format nahi mila.")
                 
                 elif msg.get("text") in ["/start", "/menu", "/status"]:
-                    get_control_menu(chat_id, "👋 *Welcome to Control Menu!*")
+                    get_control_menu(chat_id, "👋 *Control Menu:*")
                     
         except Exception as e:
             print("Listener Error:", e)
@@ -394,3 +350,4 @@ if __name__ == "__main__":
     threading.Thread(target=youtube_feed_listener, daemon=True).start()
     threading.Thread(target=telegram_file_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
+        
