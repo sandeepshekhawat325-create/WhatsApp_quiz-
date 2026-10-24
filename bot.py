@@ -395,6 +395,47 @@ def admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def build_schedule_string(date_text: str, hour_text: str, minute_text: str, ampm_text: str) -> str:
+    try:
+        return f"{date_text} {hour_text}:{minute_text} {ampm_text}"
+    except Exception:
+        return ""
+
+
+def schedule_exam_job(exam_id: int, scheduled_datetime: str):
+    try:
+        # format: YYYY-MM-DD HH:MM AM/PM
+        parsed = datetime.strptime(scheduled_datetime.strip(), "%Y-%m-%d %I:%M %p")
+        local_dt = IST.localize(parsed)
+        scheduler.add_job(
+            post_exam_to_channel,
+            "date",
+            run_date=local_dt,
+            args=[exam_id],
+            id=f"exam_job_{exam_id}",
+            replace_existing=True,
+        )
+        return True, local_dt
+    except Exception as exc:
+        logger.exception("schedule_exam_job failed: %s", exc)
+        return False, None
+
+
+def update_exam_schedule(exam_id: int, scheduled_datetime: str):
+    try:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE exams SET scheduled_time = ? WHERE id = ?",
+            (scheduled_datetime, exam_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        logger.exception("update_exam_schedule failed: %s", exc)
+        return False
+
+
 # ---------------------------
 # Bot handlers
 # ---------------------------
@@ -505,6 +546,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
+    success, _ = schedule_exam_job(exam_id, scheduled_time)
+    if not success:
+        await update.message.reply_text("⚠️ डेट फॉर्मेट सही नहीं है। फिर से try करें।")
+        return
+
     await post_advance_announcement(
         exam_id,
         draft["subject"],
@@ -513,20 +559,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scheduled_time,
         len(parsed_qs),
     )
-
-    try:
-        naive_dt = datetime.strptime(scheduled_time, "%Y-%m-%d %I:%M %p")
-        run_time = IST.localize(naive_dt)
-        scheduler.add_job(
-            post_exam_to_channel,
-            "date",
-            run_date=run_time,
-            args=[exam_id],
-            id=f"exam_job_{exam_id}",
-            replace_existing=True,
-        )
-    except Exception as e:
-        logger.exception("Scheduler Error: %s", e)
 
     admin_drafts.pop(user_id, None)
     await update.message.reply_text(
@@ -936,7 +968,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📁 **Time Set**: `{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}`\n\nNow send your `.docx` file.",
                 parse_mode="Markdown",
             )
-        return
+            return
+
+        if draft.get("action") == "reschedule_date":
+            draft["ampm"] = ampm_val
+            exam_id = int(draft.get("exam_id", 0))
+            if exam_id:
+                scheduled_time = build_schedule_string(draft.get("date", ""), draft.get("hour", "00"), draft.get("minute", "00"), ampm_val)
+                if scheduled_time and update_exam_schedule(exam_id, scheduled_time):
+                    success, _ = schedule_exam_job(exam_id, scheduled_time)
+                    await query.edit_message_text(
+                        f"✅ *Exam #{exam_id} rescheduled successfully*\n\n⏰ New Time: `{scheduled_time}`",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await query.edit_message_text("❌ Reschedule failed. Please retry with proper date format.", parse_mode="Markdown")
+            admin_drafts.pop(user_id, None)
+            return
 
     if data.startswith("ans_"):
         parts = data.split("_")
