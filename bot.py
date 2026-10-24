@@ -1,6 +1,5 @@
 import os
 import io
-import time
 import logging
 import urllib.parse
 from flask import Flask, request
@@ -15,9 +14,11 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")  # e.g. @your_channel_username or -100xxx
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://whatsapp-quiz-pt5d.onrender.com")
+PORT = int(os.environ.get("PORT", 10000))
 
-# Flask App for Webhook / Keep-alive
+# Flask App for Render Web Service Health Check
 app = Flask(__name__)
 
 # Global In-Memory Queue for Quizzes
@@ -26,7 +27,20 @@ is_auto_posting = False
 
 @app.route('/')
 def home():
-    return "Quiz Bot is running smoothly!"
+    return "Quiz Bot Webhook is active and running smoothly!"
+
+# Global application variable for webhook handling
+application = None
+
+async def setup_bot():
+    global application
+    if application is None:
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        await application.initialize()
+    return application
 
 def extract_text_from_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -41,15 +55,6 @@ def extract_text_from_docx(file_bytes):
     return text
 
 def parse_mcqs_from_text(text):
-    """
-    Simple parser expecting structured text format:
-    Q: Question text?
-    A) Option 1
-    B) Option 2
-    C) Option 3
-    D) Option 4
-    Ans: A
-    """
     questions = []
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     
@@ -146,7 +151,6 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE):
     opts = item["options"]
     correct = item["correct_option_id"]
 
-    # Format text for WhatsApp Share URL
     wa_text = f"❓ *{q_text}*\n\n"
     for idx, opt in enumerate(opts):
         prefix = ["A", "B", "C", "D"][idx]
@@ -160,7 +164,6 @@ async def send_next_quiz(context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Send Poll to Telegram Channel with WhatsApp Share Button
     if TELEGRAM_CHANNEL_ID:
         try:
             await context.bot.send_poll(
@@ -193,34 +196,49 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "start_auto":
         is_auto_posting = True
         await query.edit_message_text("▶️ Auto posting started! Posting 1 poll every 5 minutes...")
-        # Start recurring job (e.g., every 300 seconds)
         context.job_queue.run_repeating(auto_post_job, interval=300, first=1)
 
     elif query.data == "stop_auto":
         is_auto_posting = False
-        # Remove active jobs
         jobs = context.job_queue.get_jobs_by_name("auto_quiz")
         for job in jobs:
             job.schedule_removal()
         await query.edit_message_text("⏸ Auto posting stopped.")
 
     elif query.data == "status":
-        await query.edit_message_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}")
+        await query.edit_manager_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}") if hasattr(query, 'edit_manager_text') else await query.edit_message_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}")
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     global is_auto_posting, quiz_queue
     if is_auto_posting and quiz_queue:
-        await send_next_quiz(context)
+        await send_next_curr = await send_next_quiz(context)
+        _ = send_next_curr
 
-def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def webhook():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    update_json = request.get_json(force=True)
+    
+    async def process():
+        app_bot = await setup_bot()
+        update = Update.de_json(update_json, app_bot.bot)
+        await app_bot.process_update(update)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(CallbackQueryHandler(button_callback))
-
-    # Run Telegram Bot
-    application.run_polling()
+    loop.run_until_complete(process())
+    return "OK", 200
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    app_bot = loop.run_until_complete(setup_bot())
+    
+    # Set webhook on Telegram automatically
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+    loop.run_until_complete(app_bot.bot.set_webhook(url=webhook_url))
+    logger.info(f"Webhook set to: {webhook_url}")
+
+    # Run Flask app to satisfy Render port requirements
+    app.run(host="0.0.0.0", port=PORT)
