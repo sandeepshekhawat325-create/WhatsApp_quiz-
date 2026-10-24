@@ -33,11 +33,27 @@ logger = logging.getLogger(__name__)
 # Timezone & config
 # ---------------------------
 IST = pytz.timezone("Asia/Kolkata")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID") or os.environ.get("TELEGRAM_CHANNEL_ID", "")
-TELEGRAM_CHANNEL_USERNAME = os.environ.get("TG_CHANNEL_USERNAME") or os.environ.get("TELEGRAM_CHANNEL_USERNAME", "")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+RAW_CHANNEL_ID = (os.environ.get("TG_CHANNEL_ID") or os.environ.get("TELEGRAM_CHANNEL_ID", "")).strip()
+TELEGRAM_CHANNEL_USERNAME = (os.environ.get("TG_CHANNEL_USERNAME") or os.environ.get("TELEGRAM_CHANNEL_USERNAME", "")).strip()
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 PORT = int(os.environ.get("PORT", 10000))
+
+
+def get_target_channel():
+    """Sahi Channel ID ya @username return karta hai taaki post hamesha channel par jaye."""
+    if RAW_CHANNEL_ID:
+        # Agar numeric ID hai (jaise -100123456789)
+        if RAW_CHANNEL_ID.lstrip("-").isdigit():
+            if not RAW_CHANNEL_ID.startswith("-"):
+                return int(f"-100{RAW_CHANNEL_ID}")
+            return int(RAW_CHANNEL_ID)
+        # Agar galti se username ID wale variable me daal diya ho
+        return RAW_CHANNEL_ID if RAW_CHANNEL_ID.startswith("@") else f"@{RAW_CHANNEL_ID}"
+    if TELEGRAM_CHANNEL_USERNAME:
+        return TELEGRAM_CHANNEL_USERNAME if TELEGRAM_CHANNEL_USERNAME.startswith("@") else f"@{TELEGRAM_CHANNEL_USERNAME}"
+    return None
+
 
 # ---------------------------
 # Flask + scheduler
@@ -85,7 +101,6 @@ def init_db():
         """
     )
 
-    # Purane database mein scoreboard_msg_id column add karne ke liye safe check
     try:
         cursor.execute("ALTER TABLE exams ADD COLUMN scoreboard_msg_id INTEGER DEFAULT 0")
     except Exception:
@@ -177,7 +192,6 @@ def init_db():
 
 
 def ensure_default_settings():
-    # show_voter_names default '1' (ON) rakha hai taaki channel poll ke answers se Scoreboard ban sake
     defaults = {
         "show_voter_names": "1",
         "allow_multiple_answers": "0",
@@ -355,18 +369,19 @@ def parse_docx_content(file_bytes):
 
 
 # ---------------------------
-# Admin UI (Matching Screenshots)
+# Admin UI
 # ---------------------------
 def build_admin_message():
+    target_ch = get_target_channel() or "❌ NOT SET"
     return (
         "⚙️ *NEW QUIZ & EXAM SETTINGS*\n\n"
+        f"📢 Target Channel: `{target_ch}`\n\n"
         f"👁️ Show Who Voted: **{'ON' if is_show_voter_names() else 'OFF'}**\n"
-        f"   _(Voter name dikhega aur Live Rank banegi)_\n"
         f"☑️ Allow Multiple Answers: **{'ON' if is_multiple_allowed() else 'OFF'}**\n"
         f"🔀 Shuffle Options: **{'ON' if is_shuffle_enabled() else 'OFF'}**\n"
         f"✅ Set Correct Answer (Quiz Mode): **{'ON' if is_quiz_mode() else 'OFF'}**\n"
-        f"⏱️ Limit Duration (Auto-Close Poll): **{'ON' if is_limit_duration_enabled() else 'OFF'}**\n"
-        f"⏳ Question Timer / Delay: `{get_timer_sec()} sec`\n"
+        f"⏱️ Limit Duration (30s Timer): **{'ON' if is_limit_duration_enabled() else 'OFF'}**\n"
+        f"⏳ Question Interval / Timer: `{get_timer_sec()} sec`\n"
         f"💡 Explanation: **{'ON' if is_explanation_enabled() else 'OFF'}**\n"
         f"🔒 Channel Lock: **{'ON' if is_channel_lock_enabled() else 'OFF'}**"
     )
@@ -417,6 +432,9 @@ def admin_keyboard():
             )
         ],
         [
+            InlineKeyboardButton("📢 Test Channel Connection", callback_data="admin_test_channel"),
+        ],
+        [
             InlineKeyboardButton("🆕 Create New Exam", callback_data="admin_create_exam"),
             InlineKeyboardButton("📋 View Exams", callback_data="admin_view_exams"),
         ],
@@ -429,6 +447,13 @@ def build_schedule_string(date_text: str, hour_text: str, minute_text: str, ampm
         return f"{date_text} {hour_text}:{minute_text} {ampm_text}"
     except Exception:
         return ""
+
+
+def trigger_channel_exam_background(exam_id: int):
+    """Scheduler ya button se bina timeout ke channel par quiz post karne ke liye."""
+    global bot_loop
+    if bot_loop and bot_loop.is_running():
+        asyncio.run_coroutine_threadsafe(post_exam_to_channel(exam_id), bot_loop)
 
 
 def schedule_exam_job(exam_id: int, scheduled_datetime: str):
@@ -465,21 +490,21 @@ def update_exam_schedule(exam_id: int, scheduled_datetime: str):
 
 
 # ---------------------------
-# Live Scoreboard System (Channel)
+# Live Scoreboard System (Channel Par)
 # ---------------------------
-async def build_scoreboard_text(exam_id: int) -> str:
+async def build_scoreboard_text(exam_id: int, current_q_idx: int = None, total_qs: int = None) -> str:
     conn = get_conn()
     exam = conn.execute(
         "SELECT subject, topic, sub_topic, status FROM exams WHERE id=?",
         (exam_id,),
     ).fetchone()
-    total_q_row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM questions WHERE exam_id=?",
-        (exam_id,),
-    ).fetchone()
-    total_q = total_q_row["cnt"] if total_q_row else 0
+    if total_qs is None:
+        total_q_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM questions WHERE exam_id=?",
+            (exam_id,),
+        ).fetchone()
+        total_qs = total_q_row["cnt"] if total_q_row else 0
 
-    # 1. Channel Polls ke answers se score calculate karna
     poll_rows = conn.execute(
         """
         SELECT ca.user_id, ca.user_name,
@@ -494,7 +519,6 @@ async def build_scoreboard_text(exam_id: int) -> str:
         (exam_id,),
     ).fetchall()
 
-    # 2. Bot DM Test (Start Live Exam button) ke results lena
     dm_rows = conn.execute(
         """
         SELECT user_id, user_name, MAX(score) as dm_score,
@@ -507,7 +531,6 @@ async def build_scoreboard_text(exam_id: int) -> str:
     ).fetchall()
     conn.close()
 
-    # Dono tarah ke attempts ko merge karna (jiska score behtar ho)
     combined = {}
     for r in poll_rows:
         uid = r["user_id"]
@@ -516,7 +539,6 @@ async def build_scoreboard_text(exam_id: int) -> str:
             "score": round(float(r["poll_score"] or 0.0), 2),
             "correct": r["correct_cnt"] or 0,
             "attempted": r["attempted_cnt"] or 0,
-            "mode": "Channel Quiz",
         }
 
     for r in dm_rows:
@@ -527,8 +549,7 @@ async def build_scoreboard_text(exam_id: int) -> str:
                 "name": r["user_name"] or "Student",
                 "score": dm_score,
                 "correct": r["correct_cnt"] or 0,
-                "attempted": total_q,
-                "mode": f"{r['time_sec']}s",
+                "attempted": total_qs,
             }
 
     sorted_users = sorted(
@@ -537,24 +558,30 @@ async def build_scoreboard_text(exam_id: int) -> str:
         reverse=True,
     )
 
-    status_badge = "🟢 LIVE UPDATING" if exam and exam["status"] == "LIVE" else "✅ EXAM ACTIVE"
+    status_badge = "🟢 LIVE QUIZ IN CHANNEL" if exam and exam["status"] == "LIVE" else "✅ EXAM COMPLETED"
+    if current_q_idx is not None:
+        status_badge = f"🟢 LIVE (Q {current_q_idx}/{total_qs})"
+
     subj = exam["subject"] if exam else "Quiz"
     topc = exam["topic"] if exam else ""
 
     text = (
         "🏆 ═══════════════════════ 🏆\n"
-        "📊 *LIVE EXAM SCOREBOARD* 📊\n"
+        "📊 *LIVE CHANNEL SCOREBOARD* 📊\n"
         "🏆 ═══════════════════════ 🏆\n\n"
         f"📚 *Subject:* `{subj}` ({topc})\n"
         f"📡 *Status:* `{status_badge}`\n"
-        f"❓ *Total Questions:* `{total_q}`\n"
-        f"👥 *Total Participants:* `{len(sorted_users)}`\n\n"
+        f"❓ *Total Questions:* `{total_qs}`\n"
+        f"👥 *Total Ranked Students:* `{len(sorted_users)}`\n\n"
     )
 
     if not sorted_users:
-        text += "⏳ _Waiting for students to attempt questions..._\n_Jaise hi koi student answer dega, uski Live Rank yahan dikhegi!_"
+        text += (
+            "⏳ _Waiting for students to answer..._\n"
+            "_Jaise hi koi student answer dega, uski Live Rank yahan update ho jayegi!_"
+        )
     else:
-        text += "🥇 *TOP RANKERS (LIVE RANK):*\n"
+        text += "🥇 *LIVE RANKING LIST:*\n"
         medals = ["🥇", "🥈", "🥉"]
         for idx, u in enumerate(sorted_users[:30], 1):
             prefix = medals[idx - 1] if idx <= 3 else f"#{idx}"
@@ -565,15 +592,16 @@ async def build_scoreboard_text(exam_id: int) -> str:
             )
 
     now_str = datetime.now(IST).strftime("%I:%M:%S %p")
-    text += f"\n🔄 _Auto-Updated at: {now_str}_"
+    text += f"\n🔄 _Last Auto-Update: {now_str}_"
     return text
 
 
-async def update_channel_scoreboard(exam_id: int):
-    if not TELEGRAM_CHANNEL_ID or not application:
+async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, total_qs: int = None):
+    target_channel = get_target_channel()
+    if not target_channel or not application:
         return
 
-    text = await build_scoreboard_text(exam_id)
+    text = await build_scoreboard_text(exam_id, current_q_idx, total_qs)
 
     conn = get_conn()
     row = conn.execute("SELECT scoreboard_msg_id FROM exams WHERE id=?", (exam_id,)).fetchone()
@@ -583,15 +611,15 @@ async def update_channel_scoreboard(exam_id: int):
     bot_info = await application.bot.get_me()
     start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
     keyboard = [
-        [InlineKeyboardButton("🚀 Attempt Test Now (Update Your Rank)", url=start_link)],
-        [InlineKeyboardButton("🔄 Refresh Scoreboard", callback_data=f"refresh_sb_{exam_id}")],
+        [InlineKeyboardButton("📝 Re-Attempt / Get Your Rank on Board", url=start_link)],
+        [InlineKeyboardButton("🔄 Refresh Live Rank", callback_data=f"refresh_sb_{exam_id}")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if msg_id:
         try:
             await application.bot.edit_message_text(
-                chat_id=TELEGRAM_CHANNEL_ID,
+                chat_id=target_channel,
                 message_id=msg_id,
                 text=text,
                 reply_markup=reply_markup,
@@ -605,7 +633,7 @@ async def update_channel_scoreboard(exam_id: int):
 
     try:
         msg = await application.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
+            chat_id=target_channel,
             text=text,
             reply_markup=reply_markup,
             parse_mode="Markdown",
@@ -615,7 +643,7 @@ async def update_channel_scoreboard(exam_id: int):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.exception("Failed to send scoreboard message: %s", e)
+        logger.exception("Failed to send scoreboard message to channel %s: %s", target_channel, e)
 
 
 # ---------------------------
@@ -634,7 +662,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 *WELCOME TO THE QUIZ BOT* 🚀\n\n"
         f"👋 Namaste {user.first_name}!\n\n"
-        "📚 Pro Quiz & Live Ranking Bot में आपका स्वागत है।\n\n"
+        "📚 Live Channel Quiz & Ranking Bot में आपका स्वागत है।\n\n"
         "⚙️ Admin Panel: `/admin`",
         parse_mode="Markdown",
     )
@@ -731,7 +759,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, _ = schedule_exam_job(exam_id, scheduled_time)
     if not success:
-        await update.message.reply_text("⚠️ डेट फॉर्मेट सही नहीं है। फिर से try करें।")
+        await update.message.reply_text("⚠️ डेट फॉर्मेट सही नहीं है (Format: YYYY-MM-DD)। फिर से try करें।")
         return
 
     await post_advance_announcement(
@@ -744,6 +772,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     admin_drafts.pop(user_id, None)
+    keyboard = [
+        [InlineKeyboardButton(f"▶️ Abhi Channel Par Live Karein (Exam #{exam_id})", callback_data=f"startnow_{exam_id}")]
+    ]
     await update.message.reply_text(
         "✅ *EXAM CREATED SUCCESSFULLY* ✅\n\n"
         f"📚 Subject: `{draft['subject']}`\n"
@@ -751,7 +782,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📑 Sub-Topic: `{draft['sub_topic']}`\n"
         f"⏰ Schedule: `{scheduled_time}`\n"
         f"❓ Total Questions: `{len(parsed_qs)}`\n"
-        f"⏱️ Interval per Question: `{timer_sec} sec`",
+        f"⏱️ Channel Question Gap: `{timer_sec} sec`\n\n"
+        "👇 Agar aap abhi turant channel par quiz post karna chahte hain toh niche button dabayein:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
 
@@ -760,11 +793,12 @@ async def ensure_channel_access(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_channel_lock_enabled():
         return True
 
-    if not TELEGRAM_CHANNEL_ID:
+    target_channel = get_target_channel()
+    if not target_channel:
         return True
 
     try:
-        member = await application.bot.get_chat_member(TELEGRAM_CHANNEL_ID, update.effective_user.id)
+        member = await application.bot.get_chat_member(target_channel, update.effective_user.id)
         if member.status in ("member", "administrator", "creator"):
             return True
     except Exception:
@@ -774,7 +808,7 @@ async def ensure_channel_access(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [[InlineKeyboardButton("🔔 Join Channel First", url=channel_link)]]
     msg_target = update.message or update.callback_query.message
     await msg_target.reply_text(
-        "🚫 *Access Restricted*\n\nTest dene ke liye pehle hamara Telegram Channel join karein.",
+        "🚫 *Access Restricted*\n\nQuiz dene ke liye pehle hamara Telegram Channel join karein.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -782,53 +816,59 @@ async def ensure_channel_access(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
-    if not TELEGRAM_CHANNEL_ID or not application:
+    target_channel = get_target_channel()
+    if not target_channel or not application:
         return
 
     share_msg = (
-        f"📢 *UPCOMING LIVE EXAM*\n\n"
+        f"📢 *UPCOMING LIVE CHANNEL QUIZ*\n\n"
         f"📚 *Subject:* {subject}\n"
         f"📖 *Topic:* {topic}\n"
         f"📑 *Sub-Topic:* {sub_topic}\n"
         f"⏰ *Exam Time:* {sched_time}\n"
         f"❓ *Total Questions:* {total_q}\n\n"
-        f"🔥 Share with your friends!"
+        f"🔥 Join the channel for Live Quiz!"
     )
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
     keyboard = [[InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)]]
 
     text = (
         "⚡ ═══════════════════════ ⚡\n"
-        "📢 LIVE EXAM ANNOUNCEMENT 📢\n"
+        "📢 UPCOMING LIVE CHANNEL QUIZ 📢\n"
         "⚡ ═══════════════════════ ⚡\n\n"
         f"📚 Subject: `{subject}`\n"
         f"📖 Topic: `{topic}`\n"
         f"📑 Sub-Topic: `{sub_topic}`\n\n"
-        f"⏰ Exam Time: `{sched_time}`\n"
+        f"⏰ Quiz Time: `{sched_time}`\n"
         f"❓ Total Questions: `{total_q}`\n"
-        f"⏱️ Time Limit: `{get_timer_sec()} sec / Q`\n"
-        f"🏆 Leaderboard: `Live Auto-Updating Rank`\n\n"
-        "👇 Share below."
+        f"⏱️ Time per Question: `{get_timer_sec()} sec`\n"
+        f"🏆 Scoreboard: `Live on Channel`\n\n"
+        "👇 *Taiyar rahein! Quiz isi channel par post hoga.*"
     )
 
     try:
         msg = await application.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
+            chat_id=target_channel,
             text=text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
-        await application.bot.pin_chat_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            message_id=msg.message_id,
-            disable_notification=False,
-        )
+        try:
+            await application.bot.pin_chat_message(
+                chat_id=target_channel,
+                message_id=msg.message_id,
+                disable_notification=False,
+            )
+        except Exception:
+            pass
     except Exception as e:
         logger.exception("Error in post_advance_announcement: %s", e)
 
 
 async def post_exam_to_channel(exam_id):
-    if not TELEGRAM_CHANNEL_ID or not application:
+    target_channel = get_target_channel()
+    if not target_channel or not application:
+        logger.error("post_exam_to_channel aborted: target_channel is missing!")
         return
 
     conn = get_conn()
@@ -845,81 +885,80 @@ async def post_exam_to_channel(exam_id):
     conn.close()
 
     if not exam or not questions:
+        logger.error("No exam or questions found for exam_id=%s", exam_id)
         return
 
     delay_sec = int(exam["question_timer"] or exam["time_per_q"] or 30)
-    bot_info = await application.bot.get_me()
-    start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
 
     share_msg = (
-        f"🔥 *LIVE EXAM STARTED!*\n\n"
+        f"🔥 *LIVE CHANNEL QUIZ STARTED!*\n\n"
         f"📚 *Subject:* {exam['subject']}\n"
         f"📖 *Topic:* {exam['topic']}\n"
         f"📑 *Sub-Topic:* {exam['sub_topic']}\n"
         f"❓ *Questions:* {len(questions)}\n"
         f"⏱ *Timer:* {delay_sec} sec / Q\n\n"
-        "Join now!"
+        "Join Channel Now!"
     )
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
 
     announcement = (
         "⚡ ═══════════════════════ ⚡\n"
-        "🚀 LIVE QUIZ EXAM STARTED! 🚀\n"
+        "🚀 LIVE CHANNEL QUIZ STARTED! 🚀\n"
         "⚡ ═══════════════════════ ⚡\n\n"
         f"📚 Subject: `{exam['subject']}`\n"
         f"📖 Topic: `{exam['topic']}`\n"
         f"📑 Sub-Topic: `{exam['sub_topic']}`\n"
         f"❓ Total Questions: `{len(questions)}`\n"
-        f"⏱️ Question Interval: `{delay_sec} sec / Q`\n"
-        "🏆 Scoreboard: `Live Auto-Updating`\n\n"
-        "👇 *Channel mein niche Polls ka answer dein ya Bot mein जाकर kabhi bhi test attempt karein!*"
+        f"⏱️ Har Question ka Samay: `{delay_sec} sec`\n"
+        "🏆 Scoreboard: `Live Updating in Channel`\n\n"
+        "👇 *Abhi niche har 30 second mein ek naya Quiz Poll aayega!*"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("🚀 Attempt Test in Bot (Anytime)", url=start_link)],
-        [InlineKeyboardButton("📲 Share to WhatsApp", url=wa_url)],
-    ]
+    keyboard = [[InlineKeyboardButton("📲 Share Quiz to WhatsApp", url=wa_url)]]
 
     try:
         msg = await application.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
+            chat_id=target_channel,
             text=announcement,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
-        await application.bot.pin_chat_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            message_id=msg.message_id,
-            disable_notification=False,
-        )
+        try:
+            await application.bot.pin_chat_message(
+                chat_id=target_channel,
+                message_id=msg.message_id,
+                disable_notification=False,
+            )
+        except Exception:
+            pass
     except Exception as e:
-        logger.exception("Error in live exam message: %s", e)
+        logger.exception("Error sending start message to channel %s: %s", target_channel, e)
+        return
 
-    # Shuru mein hi Live Scoreboard message channel par bhej dena
-    await update_channel_scoreboard(exam_id)
+    # 1. Channel par Live Scoreboard post karna
+    await update_channel_scoreboard(exam_id, 1, len(questions))
 
-    # Har question ko 30 sec (delay_sec) ke gap par channel mein post karna
+    # 2. Channel par ek-ek karke 30 sec (delay_sec) ke gap par saare Quiz Polls post karna
     total_qs = len(questions)
     for idx, q in enumerate(questions, 1):
         await send_channel_poll(exam_id, q["id"], idx, total_qs, delay_sec)
+        await update_channel_scoreboard(exam_id, idx, total_qs)
         if idx < total_qs:
             await asyncio.sleep(delay_sec)
 
     conn = get_conn()
     conn.execute("UPDATE exams SET status='COMPLETED' WHERE id=?", (exam_id,))
-    conn.commit()
-    conn.close()
-
-    # Exam ke saare questions post hone ke baad Scoreboard ko naye message ke roop mein sabse niche laana
-    conn = get_conn()
+    # Final Scoreboard ko sabse niche naye message ke roop mein post karne ke liye msg_id reset
     conn.execute("UPDATE exams SET scoreboard_msg_id=0 WHERE id=?", (exam_id,))
     conn.commit()
     conn.close()
+
     await update_channel_scoreboard(exam_id)
 
 
 async def send_channel_poll(exam_id, question_id, q_num=1, total_qs=1, timer_sec=30):
-    if not TELEGRAM_CHANNEL_ID or not application:
+    target_channel = get_target_channel()
+    if not target_channel or not application:
         return
 
     conn = get_conn()
@@ -933,10 +972,13 @@ async def send_channel_poll(exam_id, question_id, q_num=1, total_qs=1, timer_sec
         return
 
     raw_options = [q["opt_a"], q["opt_b"], q["opt_c"], q["opt_d"]]
-    indexed_options = [(i, opt) for i, opt in enumerate(raw_options) if opt]
+    indexed_options = [(i, str(opt)[:100]) for i, opt in enumerate(raw_options) if opt and str(opt).strip()]
 
-    # Agar Shuffle Options ON hai toh options ka order random karna aur sahi option track karna
-    correct_orig_idx = int(q["correct_opt_id"])
+    if len(indexed_options) < 2:
+        logger.warning("Question %s has fewer than 2 options, skipping.", question_id)
+        return
+
+    correct_orig_idx = int(q["correct_opt_id"] or 0)
     if is_shuffle_enabled():
         random.shuffle(indexed_options)
 
@@ -950,7 +992,6 @@ async def send_channel_poll(exam_id, question_id, q_num=1, total_qs=1, timer_sec
     is_anonymous = not is_show_voter_names()
     allow_multiple = is_multiple_allowed()
     quiz_mode = is_quiz_mode()
-    # Telegram Quiz mode mein multiple answers ek sath allow nahi karta
     if quiz_mode:
         allow_multiple = False
 
@@ -959,10 +1000,12 @@ async def send_channel_poll(exam_id, question_id, q_num=1, total_qs=1, timer_sec
 
     question_header = f"[Q {q_num}/{total_qs}] {q['question_text']}"
 
+    poll = None
     try:
+        # Pehle user setting ke hisaab se poll bhejne ki koshish karein
         poll = await application.bot.send_poll(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            question=question_header[:300],  # Telegram 300 chars limit for poll question
+            chat_id=target_channel,
+            question=question_header[:300],
             options=options,
             is_anonymous=is_anonymous,
             allows_multiple_answers=allow_multiple,
@@ -971,16 +1014,33 @@ async def send_channel_poll(exam_id, question_id, q_num=1, total_qs=1, timer_sec
             explanation=explanation[:200] if explanation else None,
             open_period=open_period,
         )
+    except Exception as e:
+        # Agar Broadcast Channel ki wajah se non-anonymous poll fail ho, toh turant Anonymous Quiz Poll bhejein!
+        logger.warning("Non-anonymous poll rejected by channel (%s). Retrying with is_anonymous=True...", e)
+        try:
+            poll = await application.bot.send_poll(
+                chat_id=target_channel,
+                question=question_header[:300],
+                options=options,
+                is_anonymous=True,
+                allows_multiple_answers=allow_multiple,
+                type="quiz" if quiz_mode else "regular",
+                correct_option_id=new_correct_idx if quiz_mode else None,
+                explanation=explanation[:200] if explanation else None,
+                open_period=open_period,
+            )
+        except Exception as e2:
+            logger.exception("Critical error sending poll to channel %s: %s", target_channel, e2)
+            return
 
+    if poll:
         conn = get_conn()
         conn.execute(
-            "INSERT INTO channel_polls (exam_id, question_id, poll_id, correct_opt_id) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO channel_polls (exam_id, question_id, poll_id, correct_opt_id) VALUES (?, ?, ?, ?)",
             (exam_id, question_id, poll.poll.id, new_correct_idx),
         )
         conn.commit()
         conn.close()
-    except Exception as e:
-        logger.exception("Error while posting poll in channel: %s", e)
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1004,7 +1064,6 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     question_id = row["question_id"]
     correct_opt = int(row["correct_opt_id"])
 
-    # Agar user ne vote retract kiya hai
     if not selected:
         conn.execute(
             "DELETE FROM channel_answers WHERE exam_id=? AND question_id=? AND user_id=?",
@@ -1018,7 +1077,6 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     selected_option = ",".join(str(i) for i in selected)
     is_correct = 1 if int(selected[0]) == correct_opt else 0
 
-    # Duplicate answer prevent karna (Update if already exists)
     existing = conn.execute(
         "SELECT id FROM channel_answers WHERE exam_id=? AND question_id=? AND user_id=?",
         (exam_id, question_id, user_id),
@@ -1045,12 +1103,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conn.commit()
     conn.close()
 
-    # Jaise hi student vote kare, turant channel par Scoreboard update karein
     await update_channel_scoreboard(exam_id)
 
 
 # ---------------------------
-# Student exam flow (In Bot DM for Late / New Students)
+# Student Re-Attempt Flow (For Live Scoreboard Ranking)
 # ---------------------------
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     conn = get_conn()
@@ -1088,7 +1145,7 @@ async def auto_advance_dm_question(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         try:
             await application.bot.send_message(
                 chat_id=chat_id,
-                text="⏰ *Time Up (30s)!* Moving to next question...",
+                text=f"⏰ *Time Up ({delay}s)!* Moving to next question...",
                 parse_mode="Markdown",
             )
             await send_next_student_question_by_chat(chat_id, user_id, context)
@@ -1130,16 +1187,15 @@ async def send_next_student_question_by_chat(chat_id: int, user_id: int, context
         exam_id = exam_data["exam_id"]
         context.user_data.pop("active_exam", None)
 
-        # Jaise hi student Bot mein test complete kare, Channel ka Scoreboard update ho jaye!
         await update_channel_scoreboard(exam_id)
 
         result_text = (
-            "🎉 *EXAM COMPLETED!* 🎉\n\n"
-            f"👤 Candidate: `{full_name}`\n"
+            "🎉 *TEST COMPLETED!* 🎉\n\n"
+            f"👤 Name: `{full_name}`\n"
             f"📊 Score: `{final_score}`\n"
-            f"✅ Correct Answers: `{correct_cnt}/{len(qs)}`\n"
-            f"⏱️ Time Taken: `{total_time} sec`\n\n"
-            "🏆 *Aapki Rank Channel ke Live Scoreboard par update kar di gayi hai!*"
+            f"✅ Correct: `{correct_cnt}/{len(qs)}`\n"
+            f"⏱️ Time: `{total_time} sec`\n\n"
+            "🏆 *Aapka Naam aur Rank Channel ke Live Scoreboard par update ho gaya hai!*"
         )
 
         if update and update.callback_query:
@@ -1161,7 +1217,7 @@ async def send_next_student_question_by_chat(chat_id: int, user_id: int, context
     timer_sec = get_timer_sec()
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = (
-        "🎯 *LIVE QUIZ QUESTION* 🎯\n\n"
+        "🎯 *QUIZ QUESTION* 🎯\n\n"
         f"📌 Q {idx + 1}/{len(qs)}\n"
         f"⏱️ Time Limit: `{timer_sec} sec`\n\n"
         f"{q['question_text']}"
@@ -1175,7 +1231,6 @@ async def send_next_student_question_by_chat(chat_id: int, user_id: int, context
     else:
         await application.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
-    # Student ke har question par 30 sec ka auto-timer lagana
     if is_limit_duration_enabled():
         asyncio.create_task(
             auto_advance_dm_question(context, chat_id, user_id, idx, current_token, timer_sec)
@@ -1187,6 +1242,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+
+    if data == "admin_test_channel":
+        target = get_target_channel()
+        if not target:
+            await query.edit_message_text(
+                "❌ **Channel Set Nahi Hai!**\n\nRender Environment Variables mein `TELEGRAM_CHANNEL_ID` (jaise `-100xxxxxxxxxx`) ya `TELEGRAM_CHANNEL_USERNAME` (jaise `@mychannel`) add karein.",
+                parse_mode="Markdown",
+            )
+            return
+        try:
+            test_poll = await application.bot.send_poll(
+                chat_id=target,
+                question="🔔 [Test Quiz] Kya Channel par Quiz Sahi se Post ho raha hai?",
+                options=["Haan, 100% Working!", "Bahut Badhiya"],
+                is_anonymous=True,
+                type="quiz",
+                correct_option_id=0,
+                open_period=30,
+            )
+            await query.edit_message_text(
+                f"✅ **Success!** Channel (`{target}`) par 30 sec timer ke sath Test Quiz Poll post ho gaya hai! Ab aapke saare exams channel par aayenge.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Channel Par Post Fail Hua!**\n\nTarget: `{target}`\nError: `{e}`\n\n⚠️ *Check karein ki Bot aapke Channel mein ADMIN hai aur uske paas 'Post Messages' ki permission ON hai.*",
+                parse_mode="Markdown",
+            )
+        return
 
     if data.startswith("refresh_sb_"):
         exam_id = int(data.split("_")[-1])
@@ -1215,7 +1299,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"• **Exam #{r['id']}**: {r['subject']} - {r['topic']} (`{r['scheduled_time']}`) [{r['status']}]\n"
             keyboard.append([
                 InlineKeyboardButton(f"⏰ Reschedule #{r['id']}", callback_data=f"resched_{r['id']}"),
-                InlineKeyboardButton(f"▶️ Start Now #{r['id']}", callback_data=f"startnow_{r['id']}"),
+                InlineKeyboardButton(f"📢 Post to Channel #{r['id']}", callback_data=f"startnow_{r['id']}"),
             ])
 
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -1223,8 +1307,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("startnow_"):
         exam_id = int(data.split("_")[1])
-        await query.edit_message_text(f"🚀 **Exam #{exam_id} को चैनल पर लाइव किया जा रहा है...**", parse_mode="Markdown")
-        asyncio.create_task(post_exam_to_channel(exam_id))
+        target = get_target_channel()
+        await query.edit_message_text(
+            f"🚀 **Exam #{exam_id} को चैनल (`{target}`) पर लाइव किया जा रहा है!**\n\nहर `{get_timer_sec()} sec` में एक-एक करके सारे सवाल चैनल पर पोस्ट होंगे।",
+            parse_mode="Markdown",
+        )
+        trigger_channel_exam_background(exam_id)
         return
 
     if data.startswith("resched_"):
@@ -1237,7 +1325,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "toggle_limit_duration":
-        # Cycles through: 30s -> 45s -> 60s -> OFF -> 30s
         if not is_limit_duration_enabled():
             set_setting("limit_duration", "1")
             set_setting("timer_sec", "30")
@@ -1408,8 +1495,7 @@ def dispatch_update(update_json):
         await application.process_update(update)
 
     try:
-        future = asyncio.run_coroutine_threadsafe(process_update(), bot_loop)
-        future.result(timeout=12)
+        asyncio.run_coroutine_threadsafe(process_update(), bot_loop)
         return True
     except Exception:
         logger.exception("Webhook update processing failed")
