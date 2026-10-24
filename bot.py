@@ -367,7 +367,6 @@ def parse_docx_content(file_bytes):
                 neg_m = 0.0
 
         else:
-            # अगर सवाल बड़ा है और अगली लाइन या पैराग्राफ में जा रहा है तो उसे कटने न दें, जोड़ दें
             if reading_question and current_q is not None:
                 current_q += "\n" + line
             elif sol:
@@ -470,8 +469,6 @@ def build_schedule_string(date_text: str, hour_text: str, minute_text: str, ampm
 
 
 def trigger_channel_exam_background(exam_id: int):
-    """शेड्यूल हुए जॉब को हटाकर तुरंत एक ही बार चैनल पर एग्जाम शुरू करता है।"""
-    global bot_loop
     try:
         scheduler.remove_job(f"exam_job_{exam_id}")
     except Exception:
@@ -622,11 +619,6 @@ async def build_scoreboard_text(exam_id: int, current_q_idx: int = None, total_q
 
 
 async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, total_qs: int = None, repost_at_bottom: bool = False):
-    """
-    केवल एक ही लीडरबोर्ड रखेगा।
-    - सामान्य अपडेट पर उसी पिन किए हुए मैसेज को Edit करेगा (सवालों के बीच नया मैसेज नहीं भेजेगा)।
-    - अगर repost_at_bottom=True है (जैसे क्विज़ के अंत में), तो पुराने लीडरबोर्ड को चैट से Delete करके सबसे नीचे नया भेजेगा और Pin करेगा।
-    """
     target_channel = get_target_channel()
     if not target_channel or not application:
         return
@@ -646,7 +638,6 @@ async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, tot
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # अगर सबसे नीचे लाना है तो पहले पुराने वाले को डिलीट करें ताकि चैट में सिर्फ लास्ट वाला ही दिखे
     if repost_at_bottom and old_msg_id:
         try:
             await application.bot.delete_message(chat_id=target_channel, message_id=old_msg_id)
@@ -654,7 +645,6 @@ async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, tot
             pass
         old_msg_id = 0
 
-    # अगर पहले से लीडरबोर्ड मैसेज मौजूद है, तो उसी को Edit करें (सवालों के बीच नया न भेजें)
     if old_msg_id:
         try:
             await application.bot.edit_message_text(
@@ -668,13 +658,11 @@ async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, tot
         except Exception as e:
             if "Message is not modified" in str(e):
                 return
-            # अगर किसी कारण एडिट फेल हो तो पुराना डिलीट करने की कोशिश करें
             try:
                 await application.bot.delete_message(chat_id=target_channel, message_id=old_msg_id)
             except Exception:
                 pass
 
-    # नया लीडरबोर्ड भेजें और उसे पिन करें
     try:
         msg = await application.bot.send_message(
             chat_id=target_channel,
@@ -699,10 +687,9 @@ async def update_channel_scoreboard(exam_id: int, current_q_idx: int = None, tot
 
 
 # ---------------------------
-# Channel Live Quiz Flow (No Duplicate, Wait for Attempt + Red Overtime)
+# Channel Live Quiz Flow
 # ---------------------------
 async def post_exam_to_channel(exam_id: int):
-    # 1. डुप्लीकेट/रिपीट रोकने का लॉक
     if exam_id in running_channel_exams:
         logger.info("Exam #%s is already running in channel, skipping duplicate call.", exam_id)
         return
@@ -726,7 +713,6 @@ async def post_exam_to_channel(exam_id: int):
         conn.close()
         return
 
-    # अगर पहले से LIVE चल रहा है तो दोबारा शुरू न करें
     if exam["status"] == "LIVE":
         conn.close()
         return
@@ -777,10 +763,8 @@ async def post_exam_to_channel(exam_id: int):
             parse_mode="HTML",
         )
 
-        # 2. केवल एक बार लीडरबोर्ड बनाएं और पिन कर दें (सवालों के बीच में दोबारा नया नहीं आएगा)
         await update_channel_scoreboard(exam_id, 1, len(questions), repost_at_bottom=True)
 
-        # 3. एक-एक करके सवाल भेजें (जब तक 30s पूरे न हों और अटेम्प्ट न हो, अगला सवाल नहीं आएगा)
         total_qs = len(questions)
         for idx, q in enumerate(questions, 1):
             await run_single_channel_question(exam_id, q, idx, total_qs, delay_sec)
@@ -790,7 +774,6 @@ async def post_exam_to_channel(exam_id: int):
         conn.commit()
         conn.close()
 
-        # 4. सारे सवाल खत्म होने पर पुराना लीडरबोर्ड डिलीट करके सबसे नीचे फाइनल लीडरबोर्ड दिखाएं
         await update_channel_scoreboard(exam_id, repost_at_bottom=True)
 
     except Exception as e:
@@ -801,12 +784,6 @@ async def post_exam_to_channel(exam_id: int):
 
 
 async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int, timer_sec: int):
-    """
-    चैनल पर एक सवाल भेजता है:
-    - अगर सवाल या ऑप्शन बड़ा है तो बिना कटे पूरा टेक्स्ट दिखाता है।
-    - 30 सेकंड काउंटडाउन चलाता है।
-    - अगर अटेम्प्ट नहीं हुआ है तो 30 सेकंड बाद 🔴 -1s, -2s, -3s रेड कलर में दिखाता है और अटेम्प्ट होने के बाद ही उत्तर व अगला सवाल आता है।
-    """
     target_channel = get_target_channel()
     if not target_channel or not application:
         return
@@ -830,17 +807,14 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
     q_text = str(q["question_text"]).strip()
     question_header = f"[Q {q_num}/{total_qs}] {q_text}"
 
-    # चेक करें कि क्या सवाल (>280 chars) या कोई ऑप्शन (>95 chars) टेलीग्राम पोल की लिमिट से बड़ा है
     is_long_content = len(question_header) > 285 or any(len(opt) > 95 for opt in full_options)
 
-    # इवेंट रीसेट करें (पता लगाने के लिए कि किसी स्टूडेंट ने अटेम्प्ट किया या नहीं)
     attempt_event = asyncio.Event()
     channel_poll_events[exam_id] = attempt_event
 
     status_msg = None
     full_q_Base_html = ""
 
-    # अगर सवाल बड़ा है तो पूरा सवाल और पूरे ऑप्शंस ऊपर साफ मैसेज में भेजें ताकि बिल्कुल न कटे
     if is_long_content:
         opts_lines = "\n".join(
             f"<b>({chr(65 + i)})</b> {html.escape(opt)}" for i, opt in enumerate(full_options)
@@ -859,7 +833,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
         except Exception as e:
             logger.warning("Could not send full question text: %s", e)
 
-    # पोल के लिए ऑप्शंस तैयार करें (अगर ऊपर पूरा दिखा दिया है तो पोल में साफ छोटा रूप दें)
     poll_question = f"[Q {q_num}/{total_qs}] {q_text}"
     if len(poll_question) > 295:
         poll_question = f"[Q {q_num}/{total_qs}] {q_text[:260]}... (पूरा प्रश्न ऊपर पढ़ें ⬆️)"
@@ -879,7 +852,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
 
     explanation = q["solution"] if (is_explanation_enabled() and q["solution"]) else None
 
-    # ध्यान दें: open_period नहीं लगाया गया है ताकि बिना अटेम्प्ट किए 30s पर पोल बंद न हो और उत्तर पहले न दिखे!
     poll_msg = None
     try:
         poll_msg = await application.bot.send_poll(
@@ -917,7 +889,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
         conn.commit()
         conn.close()
 
-    # अगर सवाल छोटा था तो टाइमर दिखाने के लिए एक छोटा लाइव टाइमर बार नीचे भेजें
     if not status_msg:
         try:
             status_msg = await application.bot.send_message(
@@ -928,7 +899,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
         except Exception:
             pass
 
-    # --- 30 सेकंड काउंटडाउन ---
     step = 5
     for remaining in range(timer_sec - step, -1, -step):
         await asyncio.sleep(step)
@@ -947,7 +917,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
             except Exception:
                 pass
 
-    # --- अगर 30 सेकंड में किसी ने अटेम्प्ट नहीं किया, तो लाल रंग में -1, -2, -3... चलाएं और अटेम्प्ट का इंतज़ार करें ---
     overtime_sec = 1
     while not attempt_event.is_set() and overtime_sec <= 60:
         if status_msg:
@@ -970,7 +939,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
         except asyncio.TimeoutError:
             overtime_sec += 2
 
-    # अटेम्प्ट पूरा होने के बाद टाइमर मैसेज को हटा दें (अगर सिर्फ टाइमर था) या सवाल के नीचे Done लिख दें
     if status_msg:
         try:
             if not full_q_Base_html:
@@ -987,7 +955,6 @@ async def run_single_channel_question(exam_id: int, q, q_num: int, total_qs: int
         except Exception:
             pass
 
-    # लीडरबोर्ड को बिना नया मैसेज भेजे चुपचाप उसी पिन मैसेज में अपडेट करें
     await update_channel_scoreboard(exam_id, q_num, total_qs, repost_at_bottom=False)
 
 
@@ -1051,16 +1018,14 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conn.commit()
     conn.close()
 
-    # अगर चैनल सवाल अटेम्प्ट के इंतज़ार में रुका है तो सिग्नल दें कि अटेम्प्ट हो गया है
     if exam_id in channel_poll_events:
         channel_poll_events[exam_id].set()
 
-    # पिन किए हुए लीडरबोर्ड को उसी जगह अपडेट करें
     await update_channel_scoreboard(exam_id, repost_at_bottom=False)
 
 
 # ---------------------------
-# Student Interactive Exam Flow (30s -> 🔴 -1s, -2s, -3s Overtime until Attempted)
+# Student Interactive Exam Flow
 # ---------------------------
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     user = update.effective_user
@@ -1078,7 +1043,6 @@ async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("⚠️ इस एग्जाम में कोई प्रश्न उपलब्ध नहीं हैं।")
         return
 
-    # अगर पहले से कोई टाइमर चल रहा हो तो उसे टोकन बदलकर रोक दें
     old_exam = context.user_data.get("active_exam")
     new_token = (old_exam.get("q_token", 0) + 10) if old_exam else 1
 
@@ -1098,15 +1062,11 @@ async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 def build_student_question_view(q: dict, idx: int, total_qs: int, elapsed: int, timer_sec: int):
-    """
-    पूरा सवाल और पूरे ऑप्शंस बिना कटे बनाता है।
-    30 सेकंड तक सामान्य टाइमर और 30 सेकंड के बाद लाल रंग में -1, -2, -3 दिखाता है।
-    """
     remaining = timer_sec - elapsed
     if remaining >= 0:
         timer_badge = f"⏱️ <b>समय शेष (Timer):</b> <code>{remaining} sec</code>"
     else:
-        overtime = remaining  # negative number: -1, -2, -3...
+        overtime = remaining
         timer_badge = (
             f"🔴 <b>ओवरटाइम (Time Over): <code>{overtime} sec</code></b>\n"
             f"⚠️ <i>जब तक आप कोई ऑप्शन अटेम्प्ट नहीं करेंगे, अगला प्रश्न और उत्तर नहीं दिखेगा!</i>"
@@ -1115,7 +1075,6 @@ def build_student_question_view(q: dict, idx: int, total_qs: int, elapsed: int, 
     raw_options = [q["opt_a"], q["opt_b"], q["opt_c"], q["opt_d"]]
     options = [str(o).strip() for o in raw_options if o and str(o).strip()]
 
-    # पूरा सवाल और सारे ऑप्शंस टेक्स्ट में साफ दिखें ताकि बड़े से बड़ा ऑप्शन भी कभी न कटे
     opts_text = "\n\n".join(
         f"<b>({chr(65 + i)})</b> {html.escape(opt)}" for i, opt in enumerate(options)
     )
@@ -1149,13 +1108,8 @@ async def live_question_timer_task(
     token: int,
     timer_sec: int,
 ):
-    """
-    सवाल पर पहले 30 सेकंड का काउंटडाउन चलाता है और अगर स्टूडेंट अटेम्प्ट नहीं करता,
-    तो अगला सवाल देने के बजाय 🔴 -1, -2, -3... रेड टाइमर चलाता रहता है जब तक वह अटेम्प्ट न कर ले!
-    """
     elapsed = 0
     while True:
-        # 30s से पहले हर 5 सेकंड में और 30s के बाद (ओवरटाइम में) हर 1 सेकंड में -1, -2, -3 अपडेट करेगा
         step = 5 if elapsed < timer_sec else 1
         await asyncio.sleep(step)
         elapsed += step
@@ -1190,7 +1144,6 @@ async def live_question_timer_task(
             if "Message is not modified" not in str(e):
                 logger.debug("Timer edit stopped: %s", e)
 
-        # सुरक्षा सीमा: 10 मिनट बाद लूप अपने आप रुक जाए
         if elapsed > timer_sec + 600:
             break
 
@@ -1231,7 +1184,6 @@ async def send_next_student_question_by_chat(
         exam_id = exam_data["exam_id"]
         context.user_data.pop("active_exam", None)
 
-        # जब कोई नया स्टूडेंट टेस्ट पूरा करे तो चैनल के पिन लीडरबोर्ड को तुरंत अपडेट करें
         await update_channel_scoreboard(exam_id, repost_at_bottom=False)
 
         result_text = (
@@ -1268,7 +1220,6 @@ async def send_next_student_question_by_chat(
         )
         exam_data["msg_id"] = msg.message_id
 
-    # लाइव टाइमर टास्क शुरू करें (30s -> 🔴 -1s, -2s, -3s)
     if is_limit_duration_enabled():
         asyncio.create_task(
             live_question_timer_task(context, chat_id, idx, current_token, timer_sec)
@@ -1499,7 +1450,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    # स्टूडेंट के जवाब देने पर: पहले सही/गलत का पॉपअप दिखाएं और तभी अगला सवाल लाएं
     if data.startswith("ans_"):
         if user_id in active_student_locks:
             await query.answer()
@@ -1517,7 +1467,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_student_locks.add(user_id)
         try:
             exam_data["answered_current"] = True
-             exam_data["q_token"] = exam_data.get("q_token", 0) + 1  # टाइमर को तुरंत रोकें
+            exam_data["q_token"] = exam_data.get("q_token", 0) + 1
 
             current_q = exam_data["questions"][q_idx]
             correct_idx = int(current_q["correct_opt_id"] or 0)
@@ -1676,7 +1626,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             draft["ampm"] = ampm_val
             draft["step"] = "file"
             await query.edit_message_text(
-                f"📁 **Time Set**: `{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}`\n\nअब अपनी `.docx` फ़ाइल भेजें।",
+                f"📁 **Time Set**: `{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}`\n\nअब अपनी `.docx` फ़ाइल भेजें。",
                 parse_mode="Markdown",
             )
             return
