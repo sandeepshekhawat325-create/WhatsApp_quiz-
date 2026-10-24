@@ -537,4 +537,148 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exam_id = draft['exam_id']
             new_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {ampm_val}"
             try:
-                naive_dt = datetime.strptime
+                naive_dt = datetime.strptime(new_time_str, "%Y-%m-%d %I:%M %p")
+                new_time_dt = IST.localize(naive_dt)
+                
+                conn = sqlite3.connect("exam_system.db")
+                cursor = conn.cursor()
+                cursor.execute("UPDATE exams SET scheduled_time=? WHERE id=?", (new_time_str, exam_id))
+                conn.commit()
+                conn.close()
+
+                job_id = f"exam_job_{exam_id}"
+                if scheduler.get_job(job_id):
+                    scheduler.reschedule_job(job_id, trigger='date', run_date=new_time_dt)
+                else:
+                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[exam_id], id=job_id)
+
+                del admin_drafts[user_id]
+                await query.edit_message_text(f"✅ **Exam #{exam_id} का नया समय `{new_time_str}` (IST) सफलतापूर्वक सेट कर दिया गया है!**")
+            except Exception as e:
+                await query.edit_message_text(f"❌ त्रुटि हुई: {e}")
+        return
+
+    if data.startswith("ans_"):
+        parts = data.split("_")
+        ans_idx = int(parts[1])
+        q_idx = int(parts[2])
+        
+        exam_data = context.user_data.get('active_exam')
+        if exam_data and exam_data['current_index'] == q_idx:
+            current_q = exam_data['questions'][q_idx]
+            correct_idx = current_q[6]
+            pos_m = current_q[7]
+            neg_m = current_q[8]
+
+            if ans_idx == correct_idx:
+                exam_data['score'] += pos_m
+            else:
+                exam_data['score'] -= neg_m
+
+            exam_data['current_index'] += 1
+            await send_next_student_question(update, context)
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if user_id in admin_drafts:
+        draft = admin_drafts[user_id]
+        action = draft.get('action')
+        step = draft.get('step')
+
+        # Reschedule flow steps
+        if action == 'reschedule_date':
+            draft['date'] = text
+            draft['action'] = 'reschedule_hour'
+            await update.message.reply_text("⏰ **घंटा (Hour) लिखें (जैसे: 02 या 08):**")
+            return
+        elif action == 'reschedule_hour':
+            draft['hour'] = text.zfill(2)
+            draft['action'] = 'reschedule_min'
+            await update.message.reply_text("⏱ **मिनट (Minute) लिखें (जैसे: 00 या 30):**")
+            return
+        elif action == 'reschedule_min':
+            draft['minute'] = text.zfill(2)
+            draft['action'] = 'reschedule_ampm'
+            keyboard = [[InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]]
+            await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        # Creation flow steps
+        if step == 'subject':
+            draft['subject'] = text
+            draft['step'] = 'topic'
+            await update.message.reply_text("📖 **Topic का नाम लिखें:**")
+        elif step == 'topic':
+            draft['topic'] = text
+            draft['step'] = 'sub_topic'
+            await update.message.reply_text("📑 **Sub-Topic का नाम लिखें:**")
+        elif step == 'sub_topic':
+            draft['sub_topic'] = text
+            draft['step'] = 'date'
+            await update.message.reply_text("📅 **तारीख (Date) लिखें (Format: YYYY-MM-DD, उदा: 2026-10-24):**")
+        elif step == 'date':
+            draft['date'] = text
+            draft['step'] = 'hour'
+            await update.message.reply_text("⏰ **घंटा (Hour) लिखें (उदा: 02 या 08):**")
+        elif step == 'hour':
+            draft['hour'] = text.zfill(2)
+            draft['step'] = 'minute'
+            await update.message.reply_text("⏱ **मिनट (Minute) लिखें (उदा: 00 या 30):**")
+        elif step == 'minute':
+            draft['minute'] = text.zfill(2)
+            draft['step'] = 'ampm'
+            keyboard = [[InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]]
+            await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ==========================================
+# WEBHOOK SETUP
+# ==========================================
+async def setup_bot():
+    global application
+    if application is None:
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("admin", admin_panel))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        
+        await application.initialize()
+    return application
+
+@app.route('/')
+def home():
+    return "Pro Exam Bot is Active and Healthy!"
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def webhook():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    update_json = request.get_json(force=True)
+    
+    async def process():
+        app_bot = await setup_bot()
+        update = Update.de_json(update_json, app_bot.bot)
+        await app_bot.process_update(update)
+
+    loop.run_until_complete(process())
+    return "OK", 200
+
+if __name__ == '__main__':
+    import asyncio
+    loop = asyncio.get_event_loop()
+    app_bot = loop.run_until_complete(setup_bot())
+    
+    scheduler.start()
+    restore_jobs()
+    
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+    loop.run_until_complete(app_bot.bot.set_webhook(url=webhook_url))
+    logger.info(f"Webhook connected: {webhook_url}")
+
+    app.run(host="0.0.0.0", port=PORT)
+
