@@ -206,13 +206,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏸ Auto posting stopped.")
 
     elif query.data == "status":
-        await query.edit_manager_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}") if hasattr(query, 'edit_manager_text') else await query.edit_message_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}")
+        await query.edit_message_text(f"📊 Current Queue Status:\nTotal remaining MCQs: {len(quiz_queue)}")
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     global is_auto_posting, quiz_queue
     if is_auto_posting and quiz_queue:
-        await send_next_curr = await send_next_quiz(context)
-        _ = send_next_curr
+        await send_next_quiz(context)
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -242,3 +241,4 @@ if __name__ == '__main__':
 
     # Run Flask app to satisfy Render port requirements
     app.run(host="0.0.0.0", port=PORT)
+                    
