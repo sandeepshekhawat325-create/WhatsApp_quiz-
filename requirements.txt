@@ -4,3 +4,5 @@ python-docx==0.8.11
 APScheduler==3.10.1
 pymupdf==1.22.5
 gunicorn==20.1.0
+pytz
+
