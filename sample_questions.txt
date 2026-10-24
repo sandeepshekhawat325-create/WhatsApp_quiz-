@@ -1,0 +1,29 @@
+Question: India ka capital kahan hai?
+A) Mumbai
+B) Delhi
+C) Kolkata
+D) Chennai
+Answer: B
+Explanation: Delhi is the capital of India.
+Positive Marks: 1.0
+Negative Marks: 0.25
+
+Question: Bharat ki rajdhani kis city ko kaha jata hai?
+A) Jaipur
+B) New Delhi
+C) Chandigarh
+D) Lucknow
+Answer: B
+Explanation: New Delhi is the national capital territory and the capital of India.
+Positive Marks: 1.0
+Negative Marks: 0.25
+
+Question: Which planet is known as the Red Planet?
+A) Venus
+B) Mars
+C) Jupiter
+D) Mercury
+Answer: B
+Explanation: Mars appears reddish because of iron oxide on its surface.
+Positive Marks: 1.0
+Negative Marks: 0.25
