@@ -12,7 +12,6 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import asyncio
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -85,7 +84,7 @@ init_db()
 admin_drafts = {}
 
 # ==========================================
-# DOCX PARSER
+# ADVANCED DOCX PARSER
 # ==========================================
 def parse_docx_content(file_bytes):
     doc = docx.Document(io.BytesIO(file_bytes))
@@ -102,7 +101,7 @@ def parse_docx_content(file_bytes):
     for line in lines:
         lower = line.lower()
         
-        if lower.startswith("question:"):
+        if lower.startswith("question") or lower.startswith("q:") or lower.startswith("q."):
             if current_q and len(options) >= 2:
                 questions.append({
                     "question": current_q,
@@ -112,32 +111,40 @@ def parse_docx_content(file_bytes):
                     "neg_marks": neg_m,
                     "solution": sol
                 })
-            current_q = line.split(":", 1)[-1].strip()
+            if ":" in line:
+                current_q = line.split(":", 1)[-1].strip()
+            else:
+                current_q = line
             options = []
             correct_idx = 0
             pos_m = 1.0
             neg_m = 0.0
             sol = ""
             
-        elif lower.startswith(("(a)", "(b)", "(c)", "(d)", "a)", "b)", "c)", "d)")):
-            opt_val = line.split(")", 1)[-1].strip() if ")" in line else line
+        elif any(lower.startswith(p) for p in ["(a)", "(b)", "(c)", "(d)", "a)", "b)", "c)", "d)", "a.", "b.", "c.", "d."]):
+            for p in ["(a)", "(b)", "(c)", "(d)", "a)", "b)", "c)", "d)", "a.", "b.", "c.", "d."]:
+                if lower.startswith(p):
+                    opt_val = line[len(p):].strip()
+                    break
+            else:
+                opt_val = line
             options.append(opt_val if opt_val else line)
             
-        elif lower.startswith(("answer:", "ans:")):
-            ans_str = line.split(":", 1)[-1].strip().lower()
+        elif "answer" in lower or lower.startswith("ans"):
+            ans_str = line.split(":", 1)[-1].strip().lower() if ":" in line else line.lower()
             if "a" in ans_str: correct_idx = 0
             elif "b" in ans_str: correct_idx = 1
             elif "c" in ans_str: correct_idx = 2
             elif "d" in ans_str: correct_idx = 3
             
-        elif lower.startswith("solution:"):
-            sol = line.split(":", 1)[-1].strip()
+        elif "solution" in lower:
+            sol = line.split(":", 1)[-1].strip() if ":" in line else line
             
-        elif lower.startswith("positive marks:"):
+        elif "positive marks" in lower:
             try: pos_m = float(line.split(":", 1)[-1].strip())
             except: pos_m = 1.0
             
-        elif lower.startswith("negative marks:"):
+        elif "negative marks" in lower:
             try: neg_m = float(line.split(":", 1)[-1].strip())
             except: neg_m = 0.0
 
@@ -151,6 +158,7 @@ def parse_docx_content(file_bytes):
             "solution": sol
         })
 
+    logger.info(f"Total parsed questions: {len(questions)}")
     return questions
 
 # ==========================================
@@ -167,7 +175,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"👋 नमस्ते {user.first_name}!\n\n"
-        "🏛 **Exam & Live Ranking Panel Bot में आपका स्वागत है।**\n\n"
+        "🏛 **Pro Exam & Live Ranking System Bot में आपका स्वागत है।**\n\n"
         "👨‍🏫 **Admin Panel:** /admin"
     )
 
@@ -192,7 +200,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     document = update.message.document
     if not document.file_name.lower().endswith(('.docx', '.doc')):
-        await update.message.reply_text("❌ कृपया केवल `.docx` (Word) फ़ाइल ही भेजें[span_4](start_span)[span_4](end_span)।")
+        await update.message.reply_text("❌ कृपया केवल `.docx` (Word) फ़ाइल ही भेजें[span_0](start_span)[span_0](end_span).")
         return
 
     file_obj = await document.get_file()
@@ -200,7 +208,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     parsed_qs = parse_docx_content(file_bytes)
     if not parsed_qs:
-        await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई[span_5](start_span)[span_5](end_span)।")
+        await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई। कृपया फ़ाइल का फॉर्मेट जांचें[span_1](start_span)[span_1](end_span).")
         return
 
     conn = sqlite3.connect("exam_system.db")
@@ -236,7 +244,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Scheduler Error: {e}")
 
     del admin_drafts[user_id]
-    await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})** बोट निर्धारित समय पर चैनल पर पोस्ट कर देगा[span_6](start_span)[span_6](end_span)!")
+    await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})** बोट निर्धारित समय पर चैनल पर पोस्ट कर देगा[span_2](start_span)[span_2](end_span)!")
 
 # ==========================================
 # CHANNEL AUTO-POSTING
@@ -277,7 +285,7 @@ async def post_exam_to_channel(exam_id):
         f"📑 **Sub-Topic:** {exam[2]}\n"
         f"❓ **Total Questions:** {total_q}\n"
         f"⏱ **Time Limit:** 30 Seconds / Question\n"
-        f"🏆 **स्र्वश्रेष्ठ रैंकिंग एग्जाम खत्म होते ही दिखेगी!**\n\n"
+        f"🏆 **रैंकिंग एग्जाम खत्म होते ही तुरंत दिखाई जाएगी!**\n\n"
         f"👇 **नीचे दिए गए बटन से परीक्षा शुरू करें:**"
     )
 
@@ -289,7 +297,7 @@ async def post_exam_to_channel(exam_id):
     )
 
 # ==========================================
-# STUDENT EXAM ENGINE WITH 30-SEC TIMER
+# STUDENT EXAM & RANKING ENGINE
 # ==========================================
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     user = update.effective_user
@@ -309,8 +317,7 @@ async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE,
         'questions': questions,
         'current_index': 0,
         'score': 0.0,
-        'start_time': datetime.now(),
-        'message_id': None
+        'start_time': datetime.now()
     }
 
     await send_next_student_question(update, context)
@@ -322,7 +329,6 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
 
     idx = exam_data['current_index']
     qs = exam_data['questions']
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
     if idx >= len(qs):
         # Finish Exam & Show Instant Ranking
@@ -357,7 +363,7 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
             f"🎉 **एग्जाम सफलतापूर्वक समाप्त हुआ!**\n\n"
             f"📊 **आपका स्कोर:** `{final_score}`\n"
             f"⏱ **कुल समय:** `{total_time} Seconds`\n"
-            f"🏆 **आपकी रैंक (Your Rank):** `#{my_rank}` (कुल छात्रों में से)\n\n"
+            f"🏆 **आपकी रैंक (Your Rank):** `#{my_rank}`\n\n"
             f"🔄 यह एग्जाम री-अटेम्प्टेबल है, आप चाहें तो /start लिंक से इसे दोबारा भी दे सकते हैं!"
         )
 
@@ -381,23 +387,9 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
     text = f"⏳ **Question {idx+1}/{len(qs)}** (Time limit: 30 Sec)\n\n{q[1]}"
     
     if update.callback_query:
-        msg = await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    
-    exam_data['message_id'] = msg.message_id
-
-    # Background Timer for 30 Seconds auto-advance
-    context.job_queue.run_once(auto_skip_question, 30, data={'user_id': user_id, 'question_index': idx}, name=f"timer_{user_id}_{idx}")
-
-async def auto_skip_question(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    user_id = job_data['user_id']
-    q_idx = job_data['question_index']
-    
-    # Check if user is still on this question
-    # (Implementation details for auto-advance timer loop)
-    pass
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -464,7 +456,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         elif step == 'sched_time':
             draft['sched_time'] = text
             draft['awaiting_file'] = True
-            await update.message.reply_text("📁 **अब अपनी `.docx` प्रश्न फ़ाइल भेजें[span_7](start_span)[span_7](end_span)。**")
+            await update.message.reply_text("📁 **अब अपनी `.docx` प्रश्न फ़ाइल भेजें[span_3](start_span)[span_3](end_span)。**")
 
 # ==========================================
 # WEBHOOK SETUP
