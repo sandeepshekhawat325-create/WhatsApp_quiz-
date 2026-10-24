@@ -655,7 +655,7 @@ def webhook():
 
 async def main_async():
     global application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).drop_pending_updates(True).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
@@ -665,6 +665,8 @@ async def main_async():
     
     await application.initialize()
     
+    # Force delete any previous webhooks and set fresh one
+    await application.bot.delete_webhook(drop_pending_updates=True)
     webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
     await application.bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook connected successfully: {webhook_url}")
@@ -674,7 +676,6 @@ async def main_async():
     
     await application.start()
     
-    # Keep the application running
     import asyncio
     while True:
         await asyncio.sleep(3600)
