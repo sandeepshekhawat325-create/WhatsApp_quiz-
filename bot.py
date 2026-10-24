@@ -4,10 +4,10 @@ import logging
 import sqlite3
 import urllib.parse
 from datetime import datetime
-import pytz
+import pytZ
 from flask import Flask, request
 import docx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -255,7 +255,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट और पिन कर दी गई है!")
 
 # ==========================================
-# ADVANCED STYLISH ANNOUNCEMENT POST
+# STYLISH ANNOUNCEMENT POST
 # ==========================================
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
     global application
@@ -633,7 +633,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ==========================================
-# WEBHOOK SETUP
+# FIXED SINGLE-LOOP WEBHOOK SETUP
 # ==========================================
 async def setup_bot():
     global application
@@ -651,22 +651,26 @@ async def setup_bot():
 
 @app.route('/')
 def home():
-    return "Pro Exam Bot is Active and Healthy!"
+    return "Pro Exam Bot is Stable and Active!"
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def webhook():
     import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     update_json = request.get_json(force=True)
     
-    async def process():
-        app_bot = await setup_bot()
-        update = Update.de_json(update_json, app_bot.bot)
-        await app_bot.process_update(update)
-
-    loop.run_until_complete(process())
+    # Use the running loop safely without creating conflicting event loops
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        asyncio.run_coroutine_threadsafe(process_update_async(update_json), loop)
+    else:
+        loop.run_until_complete(process_update_async(update_json))
+        
     return "OK", 200
+
+async def process_update_async(update_json):
+    app_bot = await setup_bot()
+    update = Update.de_json(update_json, app_bot.bot)
+    await app_bot.process_update(update)
 
 if __name__ == '__main__':
     import asyncio
@@ -681,4 +685,3 @@ if __name__ == '__main__':
     logger.info(f"Webhook connected: {webhook_url}")
 
     app.run(host="0.0.0.0", port=PORT)
-
