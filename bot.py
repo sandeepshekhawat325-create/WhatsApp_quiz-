@@ -6,6 +6,7 @@ import urllib.parse
 from datetime import datetime
 import pytz
 import docx
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -23,9 +24,13 @@ IST = pytz.timezone('Asia/Kolkata')
 # Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID") or os.environ.get("TELEGRAM_CHANNEL_ID", "")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+PORT = int(os.environ.get("PORT", 10000))
 
-# Scheduler with IST timezone
+# Flask App & Scheduler
+app = Flask(__name__)
 scheduler = AsyncIOScheduler(timezone=IST)
+application = None
 
 # ==========================================
 # DATABASE SETUP (SQLite)
@@ -230,7 +235,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await post_advance_announcement(context, exam_id, draft['subject'], draft['topic'], draft['sub_topic'], sched_time_str, len(parsed_qs))
+    await post_advance_announcement(exam_id, draft['subject'], draft['topic'], draft['sub_topic'], sched_time_str, len(parsed_qs))
 
     try:
         naive_dt = datetime.strptime(sched_time_str, "%Y-%m-%d %I:%M %p")
@@ -239,7 +244,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             post_exam_to_channel,
             'date',
             run_date=run_time,
-            args=[context, exam_id],
+            args=[exam_id],
             id=f"exam_job_{exam_id}",
             replace_existing=True
         )
@@ -249,11 +254,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del admin_drafts[user_id]
     await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट और पिन कर दी गई है!")
 
-# ==========================================
-# STYLISH ANNOUNCEMENT POST
-# ==========================================
-async def post_advance_announcement(context: ContextTypes.DEFAULT_TYPE, exam_id, subject, topic, sub_topic, sched_time, total_q):
-    if not TELEGRAM_CHANNEL_ID:
+async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
+    global application
+    if not TELEGRAM_CHANNEL_ID or not application:
         return
 
     share_msg = (
@@ -287,13 +290,13 @@ async def post_advance_announcement(context: ContextTypes.DEFAULT_TYPE, exam_id,
     )
 
     try:
-        msg = await context.bot.send_message(
+        msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
             text=announcement_text,
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-        await context.bot.pin_chat_message(
+        await application.bot.pin_chat_message(
             chat_id=TELEGRAM_CHANNEL_ID,
             message_id=msg.message_id,
             disable_notification=False
@@ -301,11 +304,9 @@ async def post_advance_announcement(context: ContextTypes.DEFAULT_TYPE, exam_id,
     except Exception as e:
         logger.error(f"Error in announcement/pin: {e}")
 
-# ==========================================
-# STYLISH LIVE EXAM POST
-# ==========================================
-async def post_exam_to_channel(context: ContextTypes.DEFAULT_TYPE, exam_id):
-    if not TELEGRAM_CHANNEL_ID:
+async def post_exam_to_channel(exam_id):
+    global application
+    if not TELEGRAM_CHANNEL_ID or not application:
         return
 
     conn = sqlite3.connect("exam_system.db")
@@ -320,7 +321,7 @@ async def post_exam_to_channel(context: ContextTypes.DEFAULT_TYPE, exam_id):
     if not exam:
         return
 
-    bot_info = await context.bot.get_me()
+    bot_info = await application.bot.get_me()
     start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
     
     share_msg = f"🔥 *LIVE EXAM IS STARTED NOW!*\n\n📚 *Subject:* {exam[0]}\n📖 *Topic:* {exam[1]}\n📑 *Sub-Topic:* {exam[2]}\n❓ *Total Questions:* {total_q}\n⏱ *Timer:* 30 Sec / Question\n\n👉 *Join Test Now:* {start_link}"
@@ -347,13 +348,13 @@ async def post_exam_to_channel(context: ContextTypes.DEFAULT_TYPE, exam_id):
     )
 
     try:
-        msg = await context.bot.send_message(
+        msg = await application.bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
             text=post_text,
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
-        await context.bot.pin_chat_message(
+        await application.bot.pin_chat_message(
             chat_id=TELEGRAM_CHANNEL_ID,
             message_id=msg.message_id,
             disable_notification=False
@@ -361,7 +362,7 @@ async def post_exam_to_channel(context: ContextTypes.DEFAULT_TYPE, exam_id):
     except Exception as e:
         logger.error(f"Error in live post/pin: {e}")
 
-def restore_jobs(application):
+def restore_jobs():
     try:
         conn = sqlite3.connect("exam_system.db")
         cursor = conn.cursor()
@@ -381,7 +382,7 @@ def restore_jobs(application):
                         post_exam_to_channel,
                         'date',
                         run_date=run_time,
-                        args=[application, exam_id],
+                        args=[exam_id],
                         id=job_id,
                         replace_existing=True
                     )
@@ -543,7 +544,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if scheduler.get_job(job_id):
                     scheduler.reschedule_job(job_id, trigger='date', run_date=new_time_dt)
                 else:
-                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[context.application, exam_id], id=job_id)
+                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[exam_id], id=job_id)
 
                 del admin_drafts[user_id]
                 await query.edit_message_text(f"✅ **Exam #{exam_id} का नया समय `{new_time_str}` (IST) सफलतापूर्वक सेट कर दिया गया है!**")
@@ -623,8 +624,38 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = [[InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]]
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
-def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).drop_pending_updates(True).build()
+# ==========================================
+# FLASK & WEBHOOK SETUP (Background Thread)
+# ==========================================
+@app.route('/')
+def home():
+    return "Pro Exam Bot Webhook is Active!"
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def webhook():
+    import asyncio
+    update_json = request.get_json(force=True)
+    
+    async def process():
+        global application
+        if application:
+            update = Update.de_json(update_json, application.bot)
+            await application.process_update(update)
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(process(), loop)
+        else:
+            loop.run_until_complete(process())
+    except RuntimeError:
+        asyncio.run(process())
+        
+    return "OK", 200
+
+async def main_async():
+    global application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
@@ -632,11 +663,34 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    scheduler.start()
-    restore_jobs(application)
+    await application.initialize()
     
-    # Run polling smoothly and clear any active webhooks or conflicts automatically
-    application.run_polling(drop_pending_updates=True)
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+    await application.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook connected successfully: {webhook_url}")
+    
+    scheduler.start()
+    restore_jobs()
+    
+    await application.start()
+    
+    # Keep the application running
+    import asyncio
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == '__main__':
-    main()
+    import threading
+    import asyncio
+
+    def run_bot():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main_async())
+
+    # Start bot in a background thread so Flask can take the main port
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
+
+    # Run Flask on the port required by Render
+    app.run(host="0.0.0.0", port=PORT)
