@@ -244,10 +244,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    # 1. Immediate Advance Announcement Post to Channel & Auto-Pin
     await post_advance_announcement(exam_id, draft['subject'], draft['topic'], draft['sub_topic'], draft['sched_time'], len(parsed_qs))
 
-    # 2. Schedule Live Exam Posting via APScheduler
     try:
         run_time = parse_time_string(draft['sched_time'])
         scheduler.add_job(
@@ -264,16 +262,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del admin_drafts[user_id]
     await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट और पिन कर दी गई है!")
 
-# ==========================================
-# ADVANCE ANNOUNCEMENT & PIN FUNCTION
-# ==========================================
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
     global application
     if not TELEGRAM_CHANNEL_ID or not application:
         return
 
-    bot_info = await application.bot.get_me()
-    
     share_msg = (
         f"📢 *UPCOMING EXAM ANNOUNCEMENT*\n\n"
         f"📚 *Subject:* {subject}\n"
@@ -308,7 +301,6 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
         parse_mode="Markdown"
     )
 
-    # Auto-pin the announcement message
     try:
         await application.bot.pin_chat_message(
             chat_id=TELEGRAM_CHANNEL_ID,
@@ -318,9 +310,6 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
     except Exception as e:
         logger.error(f"Error pinning message: {e}")
 
-# ==========================================
-# LIVE EXAM AUTO-POSTING AT SCHEDULED TIME
-# ==========================================
 async def post_exam_to_channel(exam_id):
     global application
     if not TELEGRAM_CHANNEL_ID or not application:
@@ -368,7 +357,6 @@ async def post_exam_to_channel(exam_id):
         parse_mode="Markdown"
     )
 
-    # Pin the live exam message as well
     try:
         await application.bot.pin_chat_message(
             chat_id=TELEGRAM_CHANNEL_ID,
@@ -378,9 +366,6 @@ async def post_exam_to_channel(exam_id):
     except Exception as e:
         logger.error(f"Error pinning live message: {e}")
 
-# ==========================================
-# STUDENT EXAM & RANKING ENGINE
-# ==========================================
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     user = update.effective_user
     
@@ -549,4 +534,84 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 conn.close()
 
                 job_id = f"exam_job_{exam_id}"
-                if scheduler.get_job(
+                if scheduler.get_job(job_id):
+                    scheduler.reschedule_job(job_id, trigger='date', run_date=new_time_dt)
+                else:
+                    scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[exam_id], id=job_id)
+
+                del admin_drafts[user_id]
+                await update.message.reply_text(f"✅ **Exam #{exam_id} का शेड्यूल सफलतापूर्वक बदलकर `{text}` कर दिया गया है!**")
+            except ValueError:
+                await update.message.reply_text("❌ गलत फॉर्मेट! कृपया सही AM/PM फॉर्मेट में लिखें (उदाहरण: `2026-10-24 02:00 PM`):")
+            return
+
+        step = draft.get('step')
+        if step == 'subject':
+            draft['subject'] = text
+            draft['step'] = 'topic'
+            await update.message.reply_text("📖 **Topic का नाम लिखें:**")
+        elif step == 'topic':
+            draft['topic'] = text
+            draft['step'] = 'sub_topic'
+            await update.message.reply_text("📑 **Sub-Topic का नाम लिखें:**")
+        elif step == 'sub_topic':
+            draft['sub_topic'] = text
+            draft['step'] = 'sched_time'
+            await update.message.reply_text("⏰ **एग्जाम का समय दर्ज करें (Format: YYYY-MM-DD HH:MM AM/PM, उदाहरण: 2026-10-24 02:00 PM):**")
+        elif step == 'sched_time':
+            try:
+                parse_time_string(text)
+                draft['sched_time'] = text
+                draft['awaiting_file'] = True
+                await update.message.reply_text("📁 **अब अपनी `.docx` प्रश्न फ़ाइल भेजें[span_2](start_span)[span_2](end_span)!**")
+            except ValueError:
+                await update.message.reply_text("❌ गलत टाइम फॉर्मेट! कृपया AM/PM के साथ लिखें (उदाहरण: `2026-10-24 02:00 PM`):")
+
+# ==========================================
+# WEBHOOK SETUP
+# ==========================================
+async def setup_bot():
+    global application
+    if application is None:
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("admin", admin_panel))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        
+        await application.initialize()
+    return application
+
+@app.route('/')
+def home():
+    return "Pro Exam Bot with Auto Announcement & Pinning is Active!"
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def webhook():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    update_json = request.get_json(force=True)
+    
+    async def process():
+        app_bot = await setup_bot()
+        update = Update.de_json(update_json, app_bot.bot)
+        await app_bot.process_update(update)
+
+    loop.run_until_complete(process())
+    return "OK", 200
+
+if __name__ == '__main__':
+    import asyncio
+    loop = asyncio.get_event_loop()
+    app_bot = loop.run_until_complete(setup_bot())
+    
+    scheduler.start()
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+    loop.run_until_complete(app_bot.bot.set_webhook(url=webhook_url))
+    logger.info(f"Webhook connected: {webhook_url}")
+
+    app.run(host="0.0.0.0", port=PORT)
+
