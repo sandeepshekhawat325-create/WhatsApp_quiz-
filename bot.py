@@ -11,13 +11,14 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
+# Environment Variables
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "@special_education_needs")
 
 WA_API_URL = os.environ.get("WA_API_URL", "")
 WA_API_TOKEN = os.environ.get("WA_API_TOKEN", "")
-WA_CHANNEL_ID = os.environ.get("WA_CHANNEL_ID", "")
+WA_CHANNEL_ID = os.environ.get("WA_CHANNEL_ID", "0029VbBrZUT6LwHeVGFnvl3Q@newsletter")
 YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "")
 
 QUEUE_FILE = "quiz_queue.json"
@@ -29,6 +30,7 @@ def home():
     status = "RUNNING" if is_bot_active() else "PAUSED"
     return f"Bot Status: {status} | Pending Questions in Queue: {q_count}"
 
+# App Notification Webhook
 @app.route('/app-notification', methods=['POST'])
 def app_notification():
     try:
@@ -88,30 +90,50 @@ def send_tg_msg_with_buttons(chat_id, text, keyboard=None):
 def send_tg_msg(chat_id, text):
     send_tg_msg_with_buttons(chat_id, text)
 
-# Telegram Channel par message bhejne ka function with error check
 def send_tg_channel_msg(text):
     if BOT_TOKEN and TG_CHANNEL_ID:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         resp = requests.post(url, json={"chat_id": TG_CHANNEL_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
         res_json = resp.json()
         if not res_json.get("ok"):
-            print("TG Msg Error:", res_json)
             return res_json.get("description", "Unknown Error")
         return None
 
-# Telegram Channel par poll bhejne ka function with error check
-def send_tg_channel_poll(quiz):
+def get_correct_option_index(answer_str, options):
+    ans_clean = answer_str.strip().lower()
+    mapping = {'a': 0, 'b': 1, 'c': 2, 'd': 3, '1': 0, '2': 1, '3': 2, '4': 3}
+    if ans_clean in mapping:
+        idx = mapping[ans_clean]
+        if idx < len(options):
+            return idx
+    for i, opt in enumerate(options):
+        if ans_clean in opt.lower():
+            return i
+    return 0
+
+# Telegram Quiz Poll (Solution inside explanation)
+def send_tg_channel_quiz(quiz):
     if BOT_TOKEN and TG_CHANNEL_ID:
+        correct_idx = get_correct_option_index(quiz["answer"], quiz["options"])
+        explanation_text = (
+            f"✅ Sahi Uttar (Answer): {quiz['answer']}\n"
+            f"💡 Vyakhya (Solution): {quiz['explanation']}\n\n"
+            f"📘 Special Education Notes | 9828625119"
+        )
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll"
         resp = requests.post(url, json={
             "chat_id": TG_CHANNEL_ID,
             "question": quiz["question"][:290],
-            "options": quiz["options"],
-            "is_anonymous": True
+            "options": quiz["options"][:10],
+            "is_anonymous": True,
+            "type": "quiz",
+            "correct_option_id": correct_idx,
+            "explanation": explanation_text[:200],
+            "explanation_parse_mode": "Markdown"
         }, timeout=10)
         res_json = resp.json()
         if not res_json.get("ok"):
-            print("TG Poll Error:", res_json)
+            print("TG Quiz Error:", res_json)
             return res_json.get("description", "Unknown Error")
         return None
 
@@ -122,6 +144,27 @@ def send_whatsapp_msg(text):
             requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": text}, timeout=15)
         except Exception as e:
             print("WhatsApp API Error:", e)
+
+def send_whatsapp_poll_with_solution(quiz):
+    if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
+        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
+        try:
+            poll_payload = {
+                "to": WA_CHANNEL_ID,
+                "title": f"❓ {quiz['question']}",
+                "options": quiz["options"][:10],
+                "count": 1
+            }
+            requests.post(f"{WA_API_URL}/messages/poll", headers=headers, json=poll_payload, timeout=15)
+            time.sleep(2)
+            sol_text = (
+                f"✅ *Sahi Uttar (Answer):* {quiz['answer']}\n"
+                f"💡 *Vyakhya (Solution):* {quiz['explanation']}\n\n"
+                f"📘 *Special Education Notes | 9828625119*"
+            )
+            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": sol_text}, timeout=15)
+        except Exception as e:
+            print("WhatsApp Poll/Text Error:", e)
 
 def extract_text_from_docx(docx_path):
     try:
@@ -150,7 +193,7 @@ def extract_mcqs_from_text(full_text):
             
         question_lines = []
         options = []
-        answer = "Check Solution"
+        answer = "a"
         explanation = "Special Education Notes | 9828625119"
         
         mode = "q"
@@ -162,9 +205,9 @@ def extract_mcqs_from_text(full_text):
             elif re.match(r'^(?:Ans|Answer|उत्तर|सही उत्तर)\s*[:\-]', line, re.I):
                 mode = "ans"
                 answer = re.sub(r'^(?:Ans|Answer|उत्तर|सही उत्तर)\s*[:\-]\s*', '', line, flags=re.I).strip()
-            elif re.match(r'^(?:Exp|Explanation|Solution|व्याख्या|हल)\s*[:\-]', line, re.I):
+            elif re.match(r'^(?:Exp|Explanation|Solution|व्याख्या|हल|Positive Marks)\s*[:\-]', line, re.I):
                 mode = "exp"
-                explanation = re.sub(r'^(?:Exp|Explanation|Solution|व्याख्या|हल)\s*[:\-]\s*', '', line, flags=re.I).strip()
+                explanation = re.sub(r'^(?:Exp|Explanation|Solution|व्याख्या|हल|Positive Marks)\s*[:\-]\s*', '', line, flags=re.I).strip()
             else:
                 if mode == "q":
                     question_lines.append(line)
@@ -184,46 +227,32 @@ def extract_mcqs_from_text(full_text):
 
 def post_next_quiz_manually(chat_id):
     if not is_bot_active():
-        send_tg_msg(chat_id, "🛑 Bot abhi **PAUSED** hai! Pehle '▶️ Resume Queue' par click karein.")
+        send_tg_msg(chat_id, "🛑 Bot abhi **PAUSED** hai! Pehle '▶️ Resume Queue' par click karein[span_3](start_span)[span_3](end_span).")
         return
         
     queue = load_queue()
     if not queue:
-        send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle koi file bhejein.")
+        send_tg_msg(chat_id, "⚠️ Queue khali hai! Pehle koi file bhejein[span_4](start_span)[span_4](end_span).")
         return
     
     quiz = queue.pop(0)
     save_queue(queue)
     
-    # WhatsApp Post
-    if WA_API_URL and WA_API_TOKEN and WA_CHANNEL_ID:
-        headers = {"Authorization": f"Bearer {WA_API_TOKEN}", "Content-Type": "application/json"}
-        try:
-            requests.post(f"{WA_API_URL}/messages/poll", headers=headers, json={"to": WA_CHANNEL_ID, "title": f"❓ {quiz['question']}", "options": quiz["options"], "count": 1}, timeout=15)
-            time.sleep(2)
-            sol_text = f"✅ *सही उत्तर:* {quiz['answer']}\n💡 *व्याख्या:* {quiz['explanation']}\n\n📘 *Special Education Notes | 9828625119*"
-            requests.post(f"{WA_API_URL}/messages/text", headers=headers, json={"to": WA_CHANNEL_ID, "body": sol_text}, timeout=15)
-        except Exception as e:
-            print("WhatsApp API Error:", e)
+    # 1. WhatsApp Channel
+    send_whatsapp_poll_with_solution(quiz)
 
-    # Telegram Channel Post with Error Catching
+    # 2. Telegram Channel Quiz Mode
     tg_error = None
     if BOT_TOKEN and TG_CHANNEL_ID:
-        err1 = send_tg_channel_poll(quiz)
-        if err1:
-            tg_error = err1
-        else:
-            time.sleep(2)
-            sol_card = f"✅ *Answer:* {quiz['answer']}\n💡 *Solution:* {quiz['explanation']}\n📘 *Special Education Notes | 9828625119*"
-            err2 = send_tg_channel_msg(sol_card)
-            if err2:
-                tg_error = err2
+        err = send_tg_channel_quiz(quiz)
+        if err:
+            tg_error = err
 
     if tg_error:
         send_tg_msg(chat_id, f"❌ Telegram Error: `{tg_error}`\n*(Kripya check karein ki bot channel par Administrator hai ya nahi!)*")
     else:
         remaining = len(queue)
-        get_control_menu(chat_id, f"✅ Poll successfully post ho gaya hai!\n📊 Baaki Queue: *{remaining} Questions*")
+        get_control_menu(chat_id, f"✅ Poll aur Solution successfully post ho gaye hain!\n📊 Baaki Queue: *{remaining} Questions*")
 
 def get_control_menu(chat_id, custom_msg="Control Panel:"):
     active = is_bot_active()
@@ -294,7 +323,7 @@ def telegram_file_listener():
                         post_next_quiz_manually(chat_id)
                     elif data == "pause":
                         set_bot_active(False)
-                        get_control_menu(chat_id, "⏸️ *Queue Rok Di Gaya Hai!*")
+                        get_control_menu(chat_id, "⏸️ *Queue Rok Di Gayi Hai!*")
                     elif data == "resume":
                         set_bot_active(True)
                         get_control_menu(chat_id, "▶️ *Queue Wapas Chalu Ho Gayi Hai!*")
@@ -350,4 +379,4 @@ if __name__ == "__main__":
     threading.Thread(target=youtube_feed_listener, daemon=True).start()
     threading.Thread(target=telegram_file_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
-        
+    
