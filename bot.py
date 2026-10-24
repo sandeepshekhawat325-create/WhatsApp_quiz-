@@ -3,6 +3,7 @@ import io
 import logging
 import sqlite3
 import urllib.parse
+import asyncio
 from datetime import datetime
 import pytz
 import docx
@@ -31,6 +32,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = Flask(__name__)
 scheduler = AsyncIOScheduler(timezone=IST)
 application = None
+bot_loop = None
 
 # ==========================================
 # DATABASE SETUP (SQLite)
@@ -38,7 +40,7 @@ application = None
 def init_db():
     conn = sqlite3.connect("exam_system.db")
     cursor = conn.cursor()
-    
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS exams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +52,7 @@ def init_db():
             status TEXT DEFAULT 'DRAFT'
         )
     ''')
-    
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS questions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +69,7 @@ def init_db():
             FOREIGN KEY(exam_id) REFERENCES exams(id)
         )
     ''')
-    
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS student_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,12 +82,14 @@ def init_db():
             FOREIGN KEY(exam_id) REFERENCES exams(id)
         )
     ''')
-    
+
     conn.commit()
     conn.close()
 
+
 init_db()
 admin_drafts = {}
+
 
 # ==========================================
 # ADVANCED DOCX PARSER
@@ -93,7 +97,7 @@ admin_drafts = {}
 def parse_docx_content(file_bytes):
     doc = docx.Document(io.BytesIO(file_bytes))
     lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    
+
     questions = []
     current_q = None
     options = []
@@ -104,7 +108,7 @@ def parse_docx_content(file_bytes):
 
     for line in lines:
         lower = line.lower()
-        
+
         if lower.startswith("question") or lower.startswith("q:") or lower.startswith("q."):
             if current_q and len(options) >= 2:
                 questions.append({
@@ -124,7 +128,7 @@ def parse_docx_content(file_bytes):
             pos_m = 1.0
             neg_m = 0.0
             sol = ""
-            
+
         elif any(lower.startswith(p) for p in ["(a)", "(b)", "(c)", "(d)", "a)", "b)", "c)", "d)", "a.", "b.", "c.", "d."]):
             for p in ["(a)", "(b)", "(c)", "(d)", "a)", "b)", "c)", "d)", "a.", "b.", "c.", "d."]:
                 if lower.startswith(p):
@@ -133,24 +137,32 @@ def parse_docx_content(file_bytes):
             else:
                 opt_val = line
             options.append(opt_val if opt_val else line)
-            
+
         elif "answer" in lower or lower.startswith("ans"):
             ans_str = line.split(":", 1)[-1].strip().lower() if ":" in line else line.lower()
-            if "a" in ans_str: correct_idx = 0
-            elif "b" in ans_str: correct_idx = 1
-            elif "c" in ans_str: correct_idx = 2
-            elif "d" in ans_str: correct_idx = 3
-            
+            if "a" in ans_str:
+                correct_idx = 0
+            elif "b" in ans_str:
+                correct_idx = 1
+            elif "c" in ans_str:
+                correct_idx = 2
+            elif "d" in ans_str:
+                correct_idx = 3
+
         elif "solution" in lower:
             sol = line.split(":", 1)[-1].strip() if ":" in line else line
-            
+
         elif "positive marks" in lower:
-            try: pos_m = float(line.split(":", 1)[-1].strip())
-            except: pos_m = 1.0
-            
+            try:
+                pos_m = float(line.split(":", 1)[-1].strip())
+            except Exception:
+                pos_m = 1.0
+
         elif "negative marks" in lower:
-            try: neg_m = float(line.split(":", 1)[-1].strip())
-            except: neg_m = 0.0
+            try:
+                neg_m = float(line.split(":", 1)[-1].strip())
+            except Exception:
+                neg_m = 0.0
 
     if current_q and len(options) >= 2:
         questions.append({
@@ -164,13 +176,14 @@ def parse_docx_content(file_bytes):
 
     return questions
 
+
 # ==========================================
 # BOT HANDLERS & ADMIN PANEL
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
-    
+
     if args and args[0].startswith("exam_"):
         exam_id = int(args[0].split("_")[1])
         await start_student_exam(update, context, exam_id)
@@ -182,10 +195,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👨‍🏫 **Admin Panel:** /admin"
     )
 
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     admin_drafts[user_id] = {}
-    
+
     keyboard = [
         [InlineKeyboardButton("➕ Create New Exam Schedule", callback_data="admin_create_exam")],
         [InlineKeyboardButton("📋 View & Reschedule Exams", callback_data="admin_view_exams")]
@@ -193,10 +207,11 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("⚙️ **Admin Control Panel:**", reply_markup=reply_markup)
 
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     draft = admin_drafts.get(user_id)
-    
+
     if not draft or draft.get('action') != 'create' or draft.get('step') != 'file':
         await update.message.reply_text("⚠️ कृपया पहले /admin से प्रक्रिया शुरू करें।")
         return
@@ -208,30 +223,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_obj = await document.get_file()
     file_bytes = await file_obj.download_as_bytearray()
-    
+
     parsed_qs = parse_docx_content(file_bytes)
     if not parsed_qs:
         await update.message.reply_text("❌ फ़ाइल से प्रश्न पढ़ने में त्रुटि हुई। फॉर्मेट जांचें!")
         return
 
     sched_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']}"
-    
+
     conn = sqlite3.connect("exam_system.db")
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO exams (subject, topic, sub_topic, time_per_q, scheduled_time, status)
         VALUES (?, ?, ?, ?, ?, 'SCHEDULED')
     ''', (draft['subject'], draft['topic'], draft['sub_topic'], 30, sched_time_str))
-    
+
     exam_id = cursor.lastrowid
-    
+
     for q in parsed_qs:
         opts = q['options'] + ["", "", "", ""]
         cursor.execute('''
             INSERT INTO questions (exam_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt_id, pos_marks, neg_marks, solution)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (exam_id, q['question'], opts[0], opts[1], opts[2], opts[3], q['correct'], q['pos_marks'], q['neg_marks'], q['solution']))
-    
+
     conn.commit()
     conn.close()
 
@@ -252,7 +267,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Scheduler Error: {e}")
 
     del admin_drafts[user_id]
-    await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट और पिन कर दी गई है!")
+    await update.message.reply_text(f"✅ **Exam Setup Successful! (Exam ID: #{exam_id})**\n\n📢 चैनल पर अगामी परीक्षा की घोषणा पोस्ट की गई है।")
+
 
 async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_time, total_q):
     global application
@@ -285,7 +301,7 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
         f"⏱ **समय सीमा (Timer):** `30 Sec / Question`\n"
         f"🏆 **रैंकिंग (Leaderboard):** `Instant Live Rank`\n\n"
         f"📌 **विशेष सूचना:**\n"
-        f"सर्वश्रेष्ठ प्रदर्शन के लिए नियत समय पर ऑनलाइन रहें! अपने दोस्तों को भी यह पोस्ट शेयर करके आमंत्रित करें। 🚀\n\n"
+        f"सर्वश्रेष्ठ प्रदर्शन के लिए नियत समय पर ऑनलाइन रहें! अपने दोस्तों को भी साझा करें।\n\n"
         f"👇 **शेयर करने के लिए नीचे बटन पर क्लिक करें:**"
     )
 
@@ -304,6 +320,7 @@ async def post_advance_announcement(exam_id, subject, topic, sub_topic, sched_ti
     except Exception as e:
         logger.error(f"Error in announcement/pin: {e}")
 
+
 async def post_exam_to_channel(exam_id):
     global application
     if not TELEGRAM_CHANNEL_ID or not application:
@@ -313,7 +330,7 @@ async def post_exam_to_channel(exam_id):
     cursor = conn.cursor()
     cursor.execute("SELECT subject, topic, sub_topic, time_per_q FROM exams WHERE id=?", (exam_id,))
     exam = cursor.fetchone()
-    
+
     cursor.execute("SELECT COUNT(*) FROM questions WHERE exam_id=?", (exam_id,))
     total_q = cursor.fetchone()[0]
     conn.close()
@@ -323,8 +340,8 @@ async def post_exam_to_channel(exam_id):
 
     bot_info = await application.bot.get_me()
     start_link = f"https://t.me/{bot_info.username}?start=exam_{exam_id}"
-    
-    share_msg = f"🔥 *LIVE EXAM IS STARTED NOW!*\n\n📚 *Subject:* {exam[0]}\n📖 *Topic:* {exam[1]}\n📑 *Sub-Topic:* {exam[2]}\n❓ *Total Questions:* {total_q}\n⏱ *Timer:* 30 Sec / Question\n\n👉 *Join Test Now:* {start_link}"
+
+    share_msg = f"🔥 *LIVE EXAM IS STARTED NOW!*\n\n📚 *Subject:* {exam[0]}\n📖 *Topic:* {exam[1]}\n📑 *Sub-Topic:* {exam[2]}\n❓ *Total Questions:* {total_q}\n⏱ *Timer:* 30 Sec / Question"
     wa_url = f"https://api.whatsapp.com/send?text={urllib.parse.quote(share_msg)}"
 
     keyboard = [
@@ -362,6 +379,7 @@ async def post_exam_to_channel(exam_id):
     except Exception as e:
         logger.error(f"Error in live post/pin: {e}")
 
+
 def restore_jobs():
     try:
         conn = sqlite3.connect("exam_system.db")
@@ -391,6 +409,7 @@ def restore_jobs():
     except Exception as e:
         logger.error(f"Error in restore_jobs: {e}")
 
+
 async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE, exam_id: int):
     conn = sqlite3.connect("exam_system.db")
     cursor = conn.cursor()
@@ -411,6 +430,7 @@ async def start_student_exam(update: Update, context: ContextTypes.DEFAULT_TYPE,
     }
 
     await send_next_student_question(update, context)
+
 
 async def send_next_student_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exam_data = context.user_data.get('active_exam')
@@ -452,7 +472,7 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
             f"📊 **आपका स्कोर (Score):** `{final_score}`\n"
             f"⏱ **कुल समय (Total Time):** `{total_time} Seconds`\n"
             f"🏆 **आपकी रैंक (Your Rank):** `#{my_rank}`\n\n"
-            f"🔄 यह एग्जाम री-अटेम्प्टेबल है, आप चाहें तो /start लिंक से इसे दोबारा भी दे सकते हैं!"
+            f"🔄 यह एग्जाम री-अटेम्प्टेबल है, आप चाहें तो /start लिंक से इसे दोबारा भी दे सकते हैं।"
         )
 
         if update.callback_query:
@@ -465,7 +485,7 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
 
     q = qs[idx]
     opts = [q[2], q[3], q[4], q[5]]
-    
+
     keyboard = []
     for o_idx, o_text in enumerate(opts):
         if o_text:
@@ -473,11 +493,12 @@ async def send_next_student_question(update: Update, context: ContextTypes.DEFAU
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = f"⏳ **Question {idx+1}/{len(qs)}** (Time limit: 30 Sec)\n\n{q[1]}"
-    
+
     if update.callback_query:
         await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -496,7 +517,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT id, subject, topic, scheduled_time FROM exams ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
-        
+
         if not rows:
             await query.edit_message_text("📋 कोई भी Scheduled Exam उपलब्ध नहीं है।")
             return
@@ -506,7 +527,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows:
             txt += f"• **Exam #{r[0]}**: {r[1]} - {r[2]} ({r[3]})\n"
             keyboard.append([InlineKeyboardButton(f"⏰ Reschedule Exam #{r[0]}", callback_data=f"resched_{r[0]}")])
-        
+
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(txt, reply_markup=reply_markup)
         return
@@ -526,14 +547,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if draft.get('action') == 'create':
             draft['ampm'] = ampm_val
             draft['step'] = 'file'
-            await query.edit_message_text(f"📁 **समय सेट हो गया ({draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']})!**\n\nअब अपनी `.docx` प्रश्न फ़ाइल भेजें:")
+            await query.edit_message_text(f"📁 **समय सेट हो गया ({draft['date']} {draft['hour']}:{draft['minute']} {draft['ampm']})!**\n\nअब अपनी `.docx` फ़ाइल भेजें।")
         elif draft.get('action') == 'reschedule_ampm':
             exam_id = draft['exam_id']
             new_time_str = f"{draft['date']} {draft['hour']}:{draft['minute']} {ampm_val}"
             try:
                 naive_dt = datetime.strptime(new_time_str, "%Y-%m-%d %I:%M %p")
                 new_time_dt = IST.localize(naive_dt)
-                
+
                 conn = sqlite3.connect("exam_system.db")
                 cursor = conn.cursor()
                 cursor.execute("UPDATE exams SET scheduled_time=? WHERE id=?", (new_time_str, exam_id))
@@ -547,7 +568,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     scheduler.add_job(post_exam_to_channel, 'date', run_date=new_time_dt, args=[exam_id], id=job_id)
 
                 del admin_drafts[user_id]
-                await query.edit_message_text(f"✅ **Exam #{exam_id} का नया समय `{new_time_str}` (IST) सफलतापूर्वक सेट कर दिया गया है!**")
+                await query.edit_message_text(f"✅ **Exam #{exam_id} का नया समय `{new_time_str}` (IST) सफलतापूर्वक सेट कर दिया गया है।**")
             except Exception as e:
                 await query.edit_message_text(f"❌ त्रुटि हुई: {e}")
         return
@@ -556,7 +577,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         ans_idx = int(parts[1])
         q_idx = int(parts[2])
-        
+
         exam_data = context.user_data.get('active_exam')
         if exam_data and exam_data['current_index'] == q_idx:
             current_q = exam_data['questions'][q_idx]
@@ -572,10 +593,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exam_data['current_index'] += 1
             await send_next_student_question(update, context)
 
+
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    
+
     if user_id in admin_drafts:
         draft = admin_drafts[user_id]
         action = draft.get('action')
@@ -624,6 +646,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = [[InlineKeyboardButton("🌅 AM", callback_data="set_am"), InlineKeyboardButton("🌇 PM", callback_data="set_pm")]]
             await update.message.reply_text("☀️ **AM या PM चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
+
 # ==========================================
 # FLASK WEBHOOK SETUP (Background Thread)
 # ==========================================
@@ -631,68 +654,66 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 def home():
     return "Pro Exam Bot Webhook is Active!"
 
+
+def dispatch_update(update_json):
+    global application, bot_loop
+    if not application or not bot_loop or not bot_loop.is_running():
+        return False
+
+    async def process_update():
+        update = Update.de_json(update_json, application.bot)
+        await application.process_update(update)
+
+    future = asyncio.run_coroutine_threadsafe(process_update(), bot_loop)
+    try:
+        future.result(timeout=10)
+    except Exception:
+        logger.exception("Webhook update could not be processed on bot loop")
+        return False
+    return True
+
+
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def webhook():
-    import asyncio
     update_json = request.get_json(force=True)
-    
-    async def process():
-        global application
-        if application:
-            update = Update.de_json(update_json, application.bot)
-            await application.process_update(update)
-
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(process(), loop)
-        else:
-            loop.run_until_complete(process())
-    except RuntimeError:
-        asyncio.run(process())
-        
+    dispatch_update(update_json)
     return "OK", 200
+
 
 async def main_async():
     global application
-    # Webhook mode setup (No polling/getUpdates used anywhere)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
+
     await application.initialize()
-    
-    # Drop pending updates and safely set the webhook URL
     await application.bot.delete_webhook(drop_pending_updates=True)
     webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
     await application.bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook connected successfully: {webhook_url}")
-    
+
     scheduler.start()
     restore_jobs()
-    
     await application.start()
-    
-    import asyncio
+
     while True:
         await asyncio.sleep(3600)
 
+
 if __name__ == '__main__':
     import threading
-    import asyncio
 
     def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main_async())
+        global bot_loop
+        bot_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(bot_loop)
+        bot_loop.run_until_complete(main_async())
 
-    # Start bot in a background thread so Flask handles the main server port
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
 
-    # Run Flask to satisfy Render's port binding requirements
     app.run(host="0.0.0.0", port=PORT)
